@@ -30,8 +30,8 @@ At a conceptual level, a UserSim rollout has four stages:
 4. **Verify the result:** Gym stores the complete episode and UserSim's probe-specific evidence and score.
 
 In this tutorial, a **task** specifies what to simulate, and an **episode** is one attempt to run that task. The
-included `usersim` Gym benchmark is an example evaluation suite with one prepared task for each of UserSim's
-13 first-party probes. UserSim itself is a simulation library, not a single benchmark.
+included UserSim environment contains an example suite with one task for each of UserSim's 13 first-party
+probes. The suite demonstrates and tests the integration; it is not a baselined benchmark.
 
 <Note>
 To run the tutorial, you only need to configure a model endpoint and run the preparation and evaluation
@@ -83,42 +83,43 @@ separate reasoning content.
 Run preparation once before starting the servers:
 
 ```bash
-gym eval prepare --benchmark usersim
+gym eval prepare --config environments/usersim/config.yaml
 ```
 
 Preparation invokes `usersim panel` and writes:
 
 ```text
-benchmarks/usersim/data/
-├── personas/0.0.2/panels/
-│   ├── en_US.parquet
-│   └── en_US.manifest.json
-└── usersim.jsonl
+environments/usersim/data/personas/0.0.2/panels/
+├── en_US.parquet
+└── en_US.manifest.json
 ```
 
 The Parquet file is the prepared population artifact. Its manifest records the panel checksum, byte size, row
-count, locale, and dataset version. `usersim.jsonl` contains lightweight sampling requests for all supported
-probe types; resolved personas are not copied into task rows.
+count, locale, and dataset version. The environment reuses the example tasks committed at
+`resources_servers/usersim/data/example.jsonl`; preparation does not generate another task file. The rows
+contain lightweight sampling requests for all supported probe types, and resolved personas are not copied
+into them.
 
 Inspect the prepared inputs:
 
 ```bash
-jq . benchmarks/usersim/data/personas/0.0.2/panels/en_US.manifest.json
-wc -l benchmarks/usersim/data/usersim.jsonl
-jq . benchmarks/usersim/data/usersim.jsonl
+jq . environments/usersim/data/personas/0.0.2/panels/en_US.manifest.json
+wc -l resources_servers/usersim/data/example.jsonl
+jq . resources_servers/usersim/data/example.jsonl
 ```
 
 ## Collect one rollout
 
-`--benchmark usersim` selects the included 13-task example suite described above. Start with only its first task
-and one repeat:
+`--environment usersim --split benchmark` selects the included 13-task example suite described above. The
+internal split remains named `benchmark` because that is the dataset type consumed by `gym eval`, but UserSim
+is an environment rather than a benchmark. Start with only the first task and one repeat:
 
 ```bash
 mkdir -p results/usersim/model-calls
 capture_dir="$(pwd)/results/usersim/model-calls"
 
 gym eval run \
-  --benchmark usersim \
+  --environment usersim \
   --agent usersim_assistant \
   --split benchmark \
   --output results/usersim/rollouts.jsonl \
@@ -230,7 +231,7 @@ After inspecting the smoke rollout, remove `--limit 1` to run the 13 prepared ex
 
 ```bash
 gym eval run \
-  --benchmark usersim \
+  --environment usersim \
   --agent usersim_assistant \
   --split benchmark \
   --output results/usersim/all-probes.jsonl \
