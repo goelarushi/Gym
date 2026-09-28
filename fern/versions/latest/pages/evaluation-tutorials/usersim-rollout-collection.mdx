@@ -1,13 +1,43 @@
 ---
-title: "Collect NeMo UserSim Rollouts"
-description: "Prepare a deterministic UserSim panel, collect a smoke rollout, and inspect the episode contracts."
+title: "Run Multi-turn User Simulation with NeMo UserSim"
+description: "Evaluate an assistant through realistic multi-turn conversations with simulated users."
 position: 4
 ---
 
-# Collect NeMo UserSim Rollouts
+# Run Multi-turn User Simulation with NeMo UserSim
 
-This tutorial runs one NeMo UserSim episode with model-call capture enabled, then separates the final episode
-record from the lower-level model calls. The benchmark includes examples for all 13 first-party UserSim probes.
+Use this tutorial when you want to evaluate an assistant through realistic multi-turn conversations instead of
+independent, single-turn prompts. NeMo UserSim creates synthetic users with varied backgrounds and goals, while
+NeMo Gym runs their conversations with your assistant at scale and records the results for evaluation.
+
+By the end of this tutorial, you will:
+
+1. Prepare a reusable population of simulated users.
+2. Run one multi-turn conversation against your model endpoint.
+3. Inspect the conversation, score, and underlying model calls.
+4. Optionally expand the run across 13 included evaluation scenarios.
+
+## Understand the workflow
+
+At a conceptual level, a UserSim rollout has four stages:
+
+1. **Prepare people:** UserSim samples a persona panel that represents the population you want to simulate.
+2. **Select a scenario:** Each task combines a deterministic persona selection with a **probe**. A probe is a
+   reusable scenario that tests a behavior, such as answering educational questions, using tools, or maintaining
+   safety boundaries.
+3. **Hold a conversation:** A simulated user and the assistant exchange messages over multiple dialogue rounds.
+   UserSim decides when the user's goal has been met or the conversation should stop.
+4. **Verify the result:** Gym stores the complete episode and UserSim's probe-specific evidence and score.
+
+In this tutorial, a **task** specifies what to simulate, and an **episode** is one attempt to run that task. The
+included `usersim` Gym benchmark is an example evaluation suite with one prepared task for each of UserSim's
+13 first-party probes. UserSim itself is a simulation library, not a single benchmark.
+
+<Note>
+To run the tutorial, you only need to configure a model endpoint and run the preparation and evaluation
+commands. You do not need to understand the internal four-Agent topology. The optional architecture section
+later on explains it for readers who want to customize models, roles, or observability.
+</Note>
 
 <Info>
 The UserSim integration is under active development. It currently installs a pinned UserSim source revision
@@ -42,31 +72,11 @@ Export the referenced secret without committing it:
 export POLICY_API_KEY="<your-api-key>"
 ```
 
-By default, the User, Assistant, Judge, and Summary Agent policies and Resources-owned tool-simulation calls
-share these settings. Use the `user_policy_*`, `assistant_policy_*`, `judge_*`, `summary_policy_*`, and
-`tool_simulation_*` settings in
-`resources_servers/usersim/configs/usersim.yaml` when they need different endpoints or models.
+The example uses this endpoint for all simulation roles and tool-simulation calls. Most users can keep this
+default. If you need different endpoints or models for individual roles, see
+`resources_servers/usersim/configs/usersim.yaml`.
 Set `policy_uses_reasoning_parser` according to the selected model; use `false` for a model that does not return
 separate reasoning content.
-
-## Understand the four-Agent topology
-
-The Environment Server keeps UserSim's Conversation Loop, but every conversational role crosses the standard
-Gym Agent `/v1/responses` boundary:
-
-- The User Agent produces the simulated user's messages.
-- The Assistant Agent produces the system-under-test responses and receives probe-specific tool access.
-- The Judge Agent performs UserSim's in-loop semantic checks.
-- The Summary Agent compresses conversation context when UserSim requests it.
-
-Each Agent has its own Agent Server and Model Server configuration. UserSim's internal model aliases remain an
-adapter detail; persisted episode invocations use the semantic `user`, `assistant`, `judge`, and `summary` roles.
-The Resources Server separately owns the prepared panel, probe tools and state, tool-result synthesis, and
-verification. Its `probe_scorer_model` reuses `judge_model` by default.
-
-Task rows can provide optional per-role Agent request defaults through `responses_create_params`. The
-Environment Server supplies each activation's current conversation as the Responses API `input`, so the task does
-not encode a prebuilt transcript.
 
 ## Prepare the persona panel
 
@@ -100,7 +110,8 @@ jq . benchmarks/usersim/data/usersim.jsonl
 
 ## Collect one rollout
 
-Start with one task and one repeat:
+`--benchmark usersim` selects the included 13-task example suite described above. Start with only its first task
+and one repeat:
 
 ```bash
 mkdir -p results/usersim/model-calls
@@ -122,6 +133,31 @@ gym eval run \
 the limit only after the smoke rollout completes. Here, `max_turns=2` bounds UserSim to two User/Assistant dialogue
 rounds. It does not bound the invocation ledger to two entries: Judge and Summary activations are recorded
 separately, and UserSim can invoke those support roles multiple times within a round.
+
+## Understand the four-Agent topology (optional)
+
+You can run the workflow without knowing this architecture. It becomes relevant when you want to assign
+different models to roles, customize Agent behavior, or interpret low-level invocation traces.
+
+The Environment Server coordinates four roles:
+
+- The **User Agent** produces the simulated user's messages.
+- The **Assistant Agent** produces the system-under-test responses and receives probe-specific tool access.
+- The **Judge Agent** performs UserSim's in-conversation semantic checks.
+- The **Summary Agent** compresses conversation context when UserSim requests it.
+
+Each role activation is a separate Responses API request to that role's Agent Server. This does not mean that
+four responses are returned to the simulated user at once: the Environment Server invokes the roles as needed
+and in order during the conversation. The four Agents can use separate Model Servers, but the tutorial's default
+configuration points them at the same endpoint.
+
+Persisted episode invocations use the semantic `user`, `assistant`, `judge`, and `summary` roles. The Resources
+Server separately owns the prepared panel, probe tools and state, tool-result synthesis, and final verification.
+Its `probe_scorer_model` reuses `judge_model` by default.
+
+Task rows can provide optional per-role request defaults through `responses_create_params`. The Environment
+Server supplies the current conversation as each activation's Responses API `input`; the task does not contain
+a prebuilt transcript.
 
 ## Inspect the collected contracts
 
