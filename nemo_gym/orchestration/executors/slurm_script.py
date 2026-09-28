@@ -499,6 +499,7 @@ def build_sbatch_script(
         repo=gi.repo if gi else None,
         ref=gi.ref if gi else None,
         prepare_cmd=prepare_cmd,
+        extra_installs=gi.extra_installs if gi else None,
     )
     prepare_command = ""
     driver_env_prefix = _resolve_env(config.driver.env) if config.driver.env else ""

@@ -175,6 +175,7 @@ def render_driver_entrypoint(
     repo: str | None,
     ref: str | None,
     prepare_cmd: str | None,
+    extra_installs: list[str] | None = None,
 ) -> str:
     """Render the srun entrypoint for the driver step.
 
@@ -203,6 +204,8 @@ def render_driver_entrypoint(
             "source .venv/bin/activate",
             "uv pip install -e .",
         ]
+        # After Gym, so a benchmark package that depends on it resolves.
+        preamble += [f"uv pip install {install}" for install in extra_installs or []]
 
     if prepare_cmd:
         preamble.append(prepare_cmd)
