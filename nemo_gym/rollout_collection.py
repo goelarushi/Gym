@@ -45,6 +45,8 @@ from nemo_gym.base_responses_api_model import (
     observability_enabled_from_config,
 )
 from nemo_gym.config_types import (
+    AgentWithoutEnvironmentServerError,
+    AmbiguousEnvironmentServerError,
     BaseNeMoGymCLIConfig,
     BaseServerConfig,
     ConfigError,
@@ -54,9 +56,11 @@ from nemo_gym.config_types import (
 from nemo_gym.exporters import export_metrics, export_rollouts, get_exporters
 from nemo_gym.global_config import (
     AGENT_REF_KEY_NAME,
+    AGENT_SERVER_REF_KEY_NAME,
     AGENT_SERVER_TYPE_KEY_NAME,
     ALLOW_UNSUPPORTED_PAIRING_ENV_VAR_NAME,
     ATTEMPT_INDEX_KEY_NAME,
+    ENVIRONMENT_SERVER_TYPE_KEY_NAME,
     RESPONSES_CREATE_PARAMS_KEY_NAME,
     ROLLOUT_ID_KEY_NAME,
     ROLLOUT_INDEX_KEY_NAME,
@@ -116,8 +120,40 @@ from nemo_gym.token_id_capture.delivery import (
 
 logger = logging.getLogger(__name__)
 
+
+def _masking_step_metrics(agent_name: str, scored: Counter, dropped: Counter) -> Dict[str, float]:
+    """In-progress view of what a run is losing to its environment rather than its policy.
+
+    ``scored`` covers persisted rollouts only, split into the unmasked ones (``count``,
+    ``reward``) and the masked ones; ``dropped`` counts what never reached the main output
+    at all. ``reward_unmasked`` averages over the unmasked rollouts alone, so the gap
+    against the existing ``reward`` series is the score lost to infrastructure. Failed and
+    omitted attempts are reported as counts, never folded into a quality average.
+
+    Empty until something is actually masked or dropped, so a healthy run exports exactly
+    what it exported before. The final numbers come from ``/aggregate_metrics``; this is
+    the progress view while the run is still going.
+    """
+    masked, unmasked = int(scored["masked"]), int(scored["count"])
+    failed, omitted = int(dropped["failed"]), int(dropped["omitted"])
+    if not (masked or failed or omitted):
+        return {}
+
+    metrics: Dict[str, float] = {}
+    persisted = masked + unmasked
+    if masked and persisted:
+        metrics[f"progress/{agent_name}/masked_pct"] = round(100 * masked / persisted, 2)
+    if unmasked:
+        metrics[f"progress/{agent_name}/reward_unmasked"] = round(100 * scored["reward"] / unmasked, 2)
+    if failed:
+        metrics[f"progress/{agent_name}/failed"] = failed
+    if omitted:
+        metrics[f"progress/{agent_name}/omitted"] = omitted
+    return metrics
+
+
 # ---------------------------------------------------------------------------
-# Failure-routing sentinels (set by agent servers, read by the dispatcher).
+# Failure-routing sentinels (set by environment servers, read by the dispatcher).
 #
 # Background:
 #   The historical contract was "every dispatched task produces one row in
@@ -132,7 +168,7 @@ logger = logging.getLogger(__name__)
 #   - Failures go to a sidecar (``<output_stem>_failures.jsonl``), one row
 #     per attempt, with ``_ng_failure_class`` set. An ``agent_run_error`` or
 #     ``agent_request_failed`` row holds no reward and no response: there was
-#     no rollout. The two differ in whether the agent answered at all.
+#     no rollout. The two differ in whether the environment server answered at all.
 #   - ``kill_shaped`` failures (Slurm SIGTERM, Ray actor died, OOM, ...) go
 #     NOWHERE: the absence of a row is the canonical signal. Resume's
 #     set-difference re-dispatches them naturally; per-task timeout bounds
@@ -155,6 +191,44 @@ NG_PERF_KEY = "ng_perf"
 _MODEL_CALL_PAYLOAD_KEYS = ("request", "response", "request_raw", "response_raw")
 
 _DEFAULT_MAX_ROLLOUT_ATTEMPTS = 3
+
+
+def _environment_servers_by_agent(global_config_dict: DictConfig) -> dict[str, list[str]]:
+    """Map each agent name to the environment servers whose ``agent_server`` names it."""
+    servers_by_agent: dict[str, list[str]] = {}
+    for name, instance in global_config_dict.items():
+        if not isinstance(instance, DictConfig):
+            continue
+        servers = instance.get(ENVIRONMENT_SERVER_TYPE_KEY_NAME)
+        if not isinstance(servers, DictConfig):
+            continue
+        for server in servers.values():
+            reference = server.get(AGENT_SERVER_REF_KEY_NAME) if isinstance(server, DictConfig) else None
+            agent_name = reference.get("name") if isinstance(reference, DictConfig) else None
+            if agent_name is not None:
+                servers_by_agent.setdefault(str(agent_name), []).append(str(name))
+    return servers_by_agent
+
+
+def _environment_server_for_agent(agent_name: str, servers_by_agent: Mapping[str, list[str]]) -> str:
+    """Return the one environment server that fronts an agent.
+
+    A row routed by its agent cannot choose between several environment servers.
+    Several servers may still front one agent when every row names its server directly.
+    """
+    servers = servers_by_agent.get(agent_name, [])
+    if len(servers) == 1:
+        return servers[0]
+    if not servers:
+        raise AgentWithoutEnvironmentServerError(
+            f"Agent '{agent_name}' has no environment server, so collection cannot reach it. "
+            "Config validation should have caught this before any server started."
+        )
+    raise AmbiguousEnvironmentServerError(
+        f"Agent '{agent_name}' is fronted by several environment servers: {sorted(servers)}. "
+        "Rows that route by agent cannot choose between them. "
+        "Remove all but one, or route these rows to an environment server by name."
+    )
 
 
 @dataclass(frozen=True)
@@ -579,6 +653,9 @@ def _normalize_health_check_ignored_checks(value) -> List[str]:
 
 class SharedRolloutCollectionConfig(UploadRolloutsConfigMixin, BaseNeMoGymCLIConfig):
     output_jsonl_fpath: str = Field(description="The output data jsonl file path.")
+    require_complete: bool = Field(
+        default=False, description="Fail on missing rollouts; enabled by default by eval submit."
+    )
     num_samples_in_parallel: Optional[int] = Field(
         default=None, description="Limit the number of concurrent samples running at once."
     )
@@ -640,6 +717,23 @@ class SharedRolloutCollectionConfig(UploadRolloutsConfigMixin, BaseNeMoGymCLICon
             "When unset, the standard single-pass collection runs."
         ),
     )
+
+    def check_completion(self, *, expected: int, results: List[Dict[str, Any]]) -> None:
+        """Reject incomplete submitted runs after saving their partial artifacts."""
+        if not self.require_complete:
+            return
+        completed = len(
+            {
+                (r.get("stage_index"), r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME])
+                for r in results
+                if r.get(NG_FAILURE_CLASS_KEY) is None and not r.get(NG_NO_PERSIST_KEY)
+            }
+        )
+        if completed < expected:
+            raise RuntimeError(
+                f"EVAL FAILED: {completed}/{expected} samples completed. "
+                f"Partial artifacts retained at {self.output_jsonl_fpath}."
+            )
 
 
 class E2ERolloutCollectionConfig(SharedRolloutCollectionConfig):
@@ -838,8 +932,8 @@ def _rollout_request_debug_summary(row: Dict[str, Any]) -> Dict[str, Any]:
 
 # Request failures that are data, not bugs. Anything else still propagates.
 _RUN_FAILURE_ERRORS = (ClientError, orjson.JSONDecodeError, TimeoutError)
-# Statuses something in front of the agent answers with; the agent itself returns 500.
-_AGENT_DID_NOT_RUN_STATUSES = frozenset({429, 502, 503, 504})
+# Statuses something in front of the environment server answers with; it returns 500 itself.
+_SERVER_DID_NOT_RUN_STATUSES = frozenset({429, 502, 503, 504})
 _MAX_FAILURE_BODY_CHARS = 2000
 
 
@@ -848,16 +942,16 @@ def _agent_request_failure_row(exc: BaseException, status: Optional[int]) -> Dic
 
     No reward and no response: an infrastructure failure is not a verifier score of zero, and a
     placeholder would read as real generation data to token capture, aggregation and trainers.
-    The class says whether the rollout ran. A NeMo Gym agent answers 500 when its own handler
-    raises, so any status it answered with means the agent ran and broke, which is also how a
+    The class says whether the rollout ran. A NeMo Gym server answers 500 when its own handler
+    raises, so any status it answered with means the rollout ran and broke, which is also how a
     model server rejecting the model's own output arrives here. A gateway status, or no reply to
     take a status from, says nothing about the rollout. Neither class carries a reward; an evaluation that wants the
     first counted names it in ``count_failure_classes_as_zero``.
     """
-    agent_ran = status is not None and status not in _AGENT_DID_NOT_RUN_STATUSES
+    rollout_ran = status is not None and status not in _SERVER_DID_NOT_RUN_STATUSES
     body = getattr(exc, "response_content", None)
     return {
-        NG_FAILURE_CLASS_KEY: (AGENT_RUN_ERROR_FAILURE_CLASS if agent_ran else AGENT_REQUEST_FAILED_FAILURE_CLASS),
+        NG_FAILURE_CLASS_KEY: (AGENT_RUN_ERROR_FAILURE_CLASS if rollout_ran else AGENT_REQUEST_FAILED_FAILURE_CLASS),
         "_ng_failure_type": type(exc).__name__,
         "_ng_failure_message": str(exc) or repr(exc),
         "_ng_failure_http_status": status,
@@ -914,7 +1008,14 @@ def _failure_rows_counted_as_zero(
             continue
         # Diagnostics stay in the sidecar: an HTTP status is a number, and the aggregator
         # averages every number it is handed.
-        scored = {k: v for k, v in row.items() if not k.startswith("_ng_failure_")}
+        scored = {
+            k: v
+            for k, v in row.items()
+            if not k.startswith("_ng_failure_") and k not in ("failure_kind", "failure_reason")
+        }
+        # This metrics-only copy honors the explicit denominator policy. The original
+        # answer, failure diagnostics, and training mask remain untouched in the sidecar.
+        scored["mask_sample"] = False
         scored.setdefault("reward", 0.0)
         counted.append(scored)
     return counted
@@ -1374,6 +1475,13 @@ class RolloutCollectionHelper(BaseModel):
         pcts_to_print = list(range(1, 100)) + [99.5, 100]
         agent_name_to_metrics = defaultdict(Counter)
         agent_name_to_counts = defaultdict(int)
+        # Quality accounting restricted to persisted rollouts: `count`/`reward` over the
+        # unmasked ones, `masked` over the rest. Token capture already reports its own
+        # masking; this is the same accounting for what an environment declares on its
+        # verify response.
+        agent_name_to_scored = defaultdict(Counter)
+        # Rollouts that never reach the main output at all, kept apart from quality.
+        agent_name_to_dropped = defaultdict(Counter)
         counts_left = Counter(r[AGENT_REF_KEY_NAME]["name"] for r in input_rows)
         dispatched_per_agent = Counter(counts_left)
         start_time = time()
@@ -1524,6 +1632,17 @@ class RolloutCollectionHelper(BaseModel):
                 )
                 agent_name_to_counts[agent_name] += 1
 
+            # Quality accounting covers only what reaches the main rollout output, which is
+            # what /aggregate_metrics later scores. Broader than `no_result`: any failure
+            # class goes to the sidecar and a kill-shaped rollout is not stored at all, so
+            # both are counted as such rather than as a reward that happened to be zero.
+            if no_persist or failure_class is not None:
+                agent_name_to_dropped[agent_name].update({"omitted" if no_persist else "failed": 1})
+            elif result.get(MASK_SAMPLE_KEY):
+                agent_name_to_scored[agent_name].update({"masked": 1})
+            else:
+                agent_name_to_scored[agent_name].update({"reward": float(result.get("reward") or 0.0), "count": 1})
+
             current_pct = 100 * len(results) / len(input_rows)
             if pcts_to_print and current_pct >= pcts_to_print[0]:
                 while pcts_to_print and current_pct >= pcts_to_print[0]:
@@ -1559,13 +1678,32 @@ class RolloutCollectionHelper(BaseModel):
                         step_metrics[f"progress/{agent_name}/reward_lower_bound"] = round(
                             100 * metrics["reward"] / (counts_left[agent_name] + agent_name_to_counts[agent_name]), 2
                         )
+                    # The union, not just the scored agents: an agent whose every request
+                    # fails never lands in `agent_name_to_counts`, and reporting only the
+                    # agents that produced a result would hide exactly the total failure
+                    # this series exists to surface.
+                    for agent_name in sorted(agent_name_to_scored.keys() | agent_name_to_dropped.keys()):
+                        step_metrics.update(
+                            _masking_step_metrics(
+                                agent_name,
+                                agent_name_to_scored.get(agent_name, Counter()),
+                                agent_name_to_dropped.get(agent_name, Counter()),
+                            )
+                        )
 
                     export_metrics(step_metrics, step=int(current_pct))
 
         results_file.close()
         failures_file.close()
 
-        if input_rows and not persisted_results:
+        # Explicitly counted failures can provide a score even when no rollout
+        # succeeded. Determine eligibility before rejecting an otherwise empty run.
+        counted = _failure_rows_counted_as_zero(
+            [failures_fpath],
+            config.count_failure_classes_as_zero,
+            {(r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]) for r in persisted_results},
+        )
+        if input_rows and not persisted_results and not counted:
             raise RuntimeError(
                 f"None of the {len(input_rows)} dispatched rollouts produced a result "
                 f"{dict(failure_counts)}. Inspect {failures_fpath}; the run has no score to report."
@@ -1583,10 +1721,8 @@ class RolloutCollectionHelper(BaseModel):
         persisted_rows.sort(key=lambda r: (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]))
         persisted_results.sort(key=lambda r: (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]))
 
-        # Compute and write aggregate metrics via /aggregate_metrics using only the
-        # rows written to the main rollouts jsonl so runtime aggregation matches
-        # `gym eval aggregate`.
-        counted: List[Dict] = []
+        # Aggregate persisted results plus explicitly counted metrics-only failures,
+        # matching `gym eval aggregate` without changing either rollout artifact.
         if config.disable_aggregation:
             print(
                 "Skipping aggregate-metrics computation because disable_aggregation=True. "
@@ -1595,11 +1731,6 @@ class RolloutCollectionHelper(BaseModel):
             aggregate_metrics_fpath = None
         else:
             print("Computing aggregate metrics")
-            counted[:] = _failure_rows_counted_as_zero(
-                [failures_fpath],
-                config.count_failure_classes_as_zero,
-                {(r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]) for r in persisted_results},
-            )
             if config.count_failure_classes_as_zero:
                 print(
                     f"Counting {len(counted)} failure row(s) as scored zeros: {config.count_failure_classes_as_zero}"
@@ -1646,6 +1777,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
             else:
                 print(format_health_report(health_result))
 
+        config.check_completion(expected=expected_rollouts, results=persisted_results)
         return results
 
     async def _call_aggregate_metrics(
@@ -1654,7 +1786,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
         rows: List[Dict],
         output_fpath: Path,
     ) -> Optional[Path]:
-        """Call /aggregate_metrics on each agent server after rollouts complete.
+        """Call /aggregate_metrics on each agent's environment server after rollouts complete.
 
         Writes a single _aggregate_metrics.json with one entry per agent (same shape
         as the old _agent_metrics.json). Returns the file path.
@@ -1671,6 +1803,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
             agent_results.setdefault(agent_name, []).append(result)
 
         server_client = self.setup_server_client()
+        servers_by_agent = _environment_servers_by_agent(server_client.global_config_dict)
 
         async def _fetch_agent_metrics(agent_name: str, agent_result_list: List[Dict]) -> Dict:
             # Strip heavyweight fields before sending, but preserve response.usage and response.incomplete_details if present.
@@ -1702,7 +1835,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
 
             agg_request = AggregateMetricsRequest(verify_responses=stripped)
             agg_response = await server_client.post(
-                server_name=agent_name,
+                server_name=_environment_server_for_agent(agent_name, servers_by_agent),
                 url_path="/aggregate_metrics",
                 json=agg_request,
             )
@@ -1847,7 +1980,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
         hints = []
         for name in unknown:
             # Naming a non-agent instance (e.g. a resources server via agent_map) is as fatal as a
-            # typo: /run only exists on agent servers.
+            # typo: rows route by agent, and only an agent has an environment server in front of it.
             if name in global_config_dict:
                 hints.append(f"{name!r} (exists but is not an agent instance)")
                 continue
@@ -1917,6 +2050,12 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
         self.resolve_task_sources(examples, server_client.global_config_dict)
         self._validate_agent_names(examples, server_client.global_config_dict)
         self._validate_agent_pairings(examples, server_client.global_config_dict)
+        # Resolve every agent before dispatch, so an unroutable agent fails the run instead of one future.
+        servers_by_agent = _environment_servers_by_agent(server_client.global_config_dict)
+        server_for_agent = {
+            agent_name: _environment_server_for_agent(agent_name, servers_by_agent)
+            for agent_name in {row[AGENT_REF_KEY_NAME]["name"] for row in examples}
+        }
         semaphore = semaphore or nullcontext()
 
         async def _post_subroutine(row: Dict) -> _CompletedRollout:
@@ -1924,7 +2063,8 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                 started_at = time()
                 res = None
                 try:
-                    res = await server_client.post(server_name=row["agent_ref"]["name"], url_path="/run", json=row)
+                    server_name = server_for_agent[row[AGENT_REF_KEY_NAME]["name"]]
+                    res = await server_client.post(server_name=server_name, url_path="/run", json=row)
                     await raise_for_status(res)
                     result = await get_response_json(res)
                     # Independently-measured task wall-clock (ng_perf.total_latency_ms), not derived

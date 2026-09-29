@@ -17,7 +17,8 @@ import json
 import pickle
 import warnings
 from asyncio import Future
-from collections import Counter
+from collections import Counter, defaultdict
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from threading import get_ident
@@ -34,7 +35,7 @@ from pydantic import ValidationError
 import nemo_gym.rollout_collection
 import nemo_gym.token_id_capture.delivery
 from nemo_gym.base_resources_server import AggregateMetrics, AggregateMetricsRequest
-from nemo_gym.config_types import ConfigError, ConfigPathNotFoundError
+from nemo_gym.config_types import AmbiguousEnvironmentServerError, ConfigError, ConfigPathNotFoundError
 from nemo_gym.global_config import (
     AGENT_REF_KEY_NAME,
     ATTEMPT_INDEX_KEY_NAME,
@@ -66,6 +67,7 @@ from nemo_gym.rollout_collection import (
     _failure_rows_counted_as_zero,
     _failures_path_for,
     _get_max_rollout_attempts,
+    _masking_step_metrics,
     _rollout_for_export,
     _rollout_request_debug_summary,
     loads_jsonl_line,
@@ -134,7 +136,12 @@ def install_fake_server_client(monkeypatch: pytest.MonkeyPatch, post: AsyncMock)
     """Route every dispatcher HTTP call through `post` and unwrap FakeResponse."""
     server_client = MagicMock()
     server_client.post = post
-    server_client.global_config_dict = OmegaConf.create({"my_agent": {"responses_api_agents": {"impl": {}}}})
+    server_client.global_config_dict = OmegaConf.create(
+        {
+            "my_agent": {"responses_api_agents": {"impl": {}}},
+            "my_environment_server": {"environment_servers": {"legacy_agent": {"agent_server": {"name": "my_agent"}}}},
+        }
+    )
     monkeypatch.setattr(
         nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: server_client
     )
@@ -763,7 +770,14 @@ class TestRolloutCollection:
 
         mock_server_client = MagicMock()
         mock_server_client.post = AsyncMock(return_value=response)
-        mock_server_client.global_config_dict = OmegaConf.create({"my_agent": {"responses_api_agents": {"impl": {}}}})
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                "my_agent": {"responses_api_agents": {"impl": {}}},
+                "my_environment_server": {
+                    "environment_servers": {"legacy_agent": {"agent_server": {"name": "my_agent"}}}
+                },
+            }
+        )
 
         monkeypatch.setattr(
             nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: mock_server_client
@@ -897,12 +911,14 @@ class TestRolloutCollection:
         assert pickle.loads(pickle.dumps(result)) == result
         assert orjson.loads(orjson.dumps(result)) == result
 
+    @pytest.mark.parametrize("require_complete", [False, True])
     async def test_run_from_config_routes_agent_failure_to_sidecar_and_out_of_metrics(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         empty_global_config: MagicMock,
+        require_complete: bool,
     ) -> None:
         """End to end: one 500 and one success, through the real dispatch and aggregation path."""
         input_jsonl_fpath = tmp_path / "input.jsonl"
@@ -932,10 +948,15 @@ class TestRolloutCollection:
             output_jsonl_fpath=str(output_jsonl_fpath),
             route_failures_to_sidecar=True,
             disable_health_check=True,
+            require_complete=require_complete,
         )
-        results = await RolloutCollectionHelper().run_from_config(config)
-
-        assert len(results) == 2
+        with (
+            pytest.raises(RuntimeError, match="EVAL FAILED: 1/2 samples completed")
+            if require_complete
+            else nullcontext()
+        ):
+            results = await RolloutCollectionHelper().run_from_config(config)
+            assert len(results) == 2
 
         persisted = [orjson.loads(line) for line in output_jsonl_fpath.read_bytes().splitlines()]
         assert [r[TASK_INDEX_KEY_NAME] for r in persisted] == [1]
@@ -1000,7 +1021,7 @@ class TestRolloutCollection:
         async def post(server_name: str, url_path: str, json: dict, **kwargs):
             if url_path == "/run":
                 dispatched.append(json)
-                return FakeResponse(200, {"reward": 1.0})
+                return FakeResponse(200, {"reward": 0.0})
             return FakeResponse(200, compute_aggregate_metrics([dict(r) for r in json.verify_responses]).model_dump())
 
         install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
@@ -1010,13 +1031,14 @@ class TestRolloutCollection:
             output_jsonl_fpath=str(output_jsonl_fpath),
             resume_from_cache=True,
             disable_health_check=True,
+            require_complete=True,
         )
         await RolloutCollectionHelper().run_from_config(config)
 
         assert len(dispatched) == 1
         assert dispatched[0][ATTEMPT_INDEX_KEY_NAME] == 1
         persisted = [orjson.loads(line) for line in output_jsonl_fpath.read_bytes().splitlines()]
-        assert [r["reward"] for r in persisted] == [1.0]
+        assert [r["reward"] for r in persisted] == [0.0]
 
     def test_failure_rows_counted_as_zero_selects_the_last_attempt_of_each_rollout(self, tmp_path: Path) -> None:
         """The last attempt stands, so it is chosen before the wanted classes are picked out."""
@@ -1126,6 +1148,163 @@ class TestRolloutCollection:
         )
         assert orjson.loads(metrics_fpath.read_bytes())[0]["key_metrics"] == {"mean/reward": expected_mean}
 
+    @pytest.mark.parametrize("count_judge_failure", [False, True])
+    async def test_masked_judge_failure_counts_as_zero_only_when_opted_in(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        empty_global_config: MagicMock,
+        count_judge_failure: bool,
+    ) -> None:
+        """Online and offline aggregation honor the opt-in without rewriting failure evidence."""
+        input_path = tmp_path / "input.jsonl"
+        input_path.write_text(
+            "".join(
+                json.dumps({"responses_create_params": {"input": []}, "agent_ref": {"name": "my_agent"}, "x": i})
+                + "\n"
+                for i in range(4)
+            )
+        )
+        output_path = tmp_path / "output.jsonl"
+        failure = {
+            "reward": 0.0,
+            "mask_sample": True,
+            "failure_kind": "judge_failed",
+            "failure_reason": "judge unavailable",
+            "instance_config": {"mask_sample": True},
+            NG_FAILURE_CLASS_KEY: "judge_failed",
+            "_ng_failure_judge_error": "judge unavailable",
+        }
+        metrics = []
+        metric_inputs = []
+
+        async def post(server_name: str, url_path: str, json, **kwargs):
+            if url_path == "/run":
+                return FakeResponse(200, failure if json["x"] == 0 else {"reward": 1.0})
+            metric_inputs.append(json.verify_responses)
+            result = compute_aggregate_metrics(json.verify_responses)
+            metrics.append(result)
+            return FakeResponse(200, result.model_dump())
+
+        install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+        counted = ["judge_failed"] if count_judge_failure else []
+        await RolloutCollectionHelper().run_from_config(
+            RolloutCollectionConfig(
+                input_jsonl_fpath=str(input_path),
+                output_jsonl_fpath=str(output_path),
+                route_failures_to_sidecar=True,
+                count_failure_classes_as_zero=counted,
+                disable_health_check=True,
+            )
+        )
+        sidecar_path = _failures_path_for(output_path)
+        original_sidecar = sidecar_path.read_bytes()
+        await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(
+                input_glob=str(output_path),
+                output_jsonl_fpath=str(tmp_path / "merged.jsonl"),
+                count_failure_classes_as_zero=counted,
+                disable_health_check=True,
+            )
+        )
+        assert len(metrics) == 2
+        for result, inputs in zip(metrics, metric_inputs):
+            assert result.key_metrics == {"mean/reward": 0.75 if count_judge_failure else 1.0}
+            assert result.agent_metrics.get("coverage/masked_rollouts", 0) == 0
+            assert len(inputs) == (4 if count_judge_failure else 3)
+            assert all("failure_kind" not in row and "failure_reason" not in row for row in inputs)
+        assert sidecar_path.read_bytes() == original_sidecar
+        saved_failure = orjson.loads(original_sidecar)
+        assert all(saved_failure[key] == value for key, value in failure.items())
+        assert len(output_path.read_text().splitlines()) == 3
+
+    @pytest.mark.parametrize("num_failures", [1, 4])
+    @pytest.mark.parametrize("counted_classes", [[], [AGENT_RUN_ERROR_FAILURE_CLASS], ["judge_failed"]])
+    @pytest.mark.parametrize("disable_aggregation", [False, True])
+    async def test_all_judge_failures_only_produce_metrics_when_explicitly_counted(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        empty_global_config: MagicMock,
+        num_failures: int,
+        counted_classes: list[str],
+        disable_aggregation: bool,
+    ) -> None:
+        """An opted-in all-failure run has a score, but never synthetic successful rollouts."""
+        input_path = tmp_path / "input.jsonl"
+        input_path.write_text(
+            "".join(
+                json.dumps({"responses_create_params": {"input": []}, "agent_ref": {"name": "my_agent"}}) + "\n"
+                for _ in range(num_failures)
+            )
+        )
+        output_path = tmp_path / "output.jsonl"
+        failure = {
+            "reward": 0.0,
+            "mask_sample": True,
+            "failure_kind": "judge_failed",
+            "failure_reason": "judge unavailable",
+            "instance_config": {"mask_sample": True},
+            NG_FAILURE_CLASS_KEY: "judge_failed",
+            "_ng_failure_judge_error": "judge unavailable",
+        }
+        metric_inputs = []
+
+        async def post(server_name: str, url_path: str, json, **kwargs):
+            if url_path == "/run":
+                return FakeResponse(200, deepcopy(failure))
+            metric_inputs.append(json.verify_responses)
+            return FakeResponse(200, compute_aggregate_metrics(json.verify_responses).model_dump())
+
+        install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+        config = RolloutCollectionConfig(
+            input_jsonl_fpath=str(input_path),
+            output_jsonl_fpath=str(output_path),
+            route_failures_to_sidecar=True,
+            count_failure_classes_as_zero=counted_classes,
+            disable_aggregation=disable_aggregation,
+            disable_health_check=True,
+        )
+        counted = "judge_failed" in counted_classes
+        if counted:
+            results = await RolloutCollectionHelper().run_from_config(config)
+            assert len(results) == num_failures and all(row["mask_sample"] for row in results)
+        else:
+            # A nonempty opt-in for another class must not bypass the no-results guard.
+            with pytest.raises(RuntimeError, match="produced a result"):
+                await RolloutCollectionHelper().run_from_config(config)
+
+        sidecar_path = _failures_path_for(output_path)
+        original_sidecar = sidecar_path.read_bytes()
+        saved = [orjson.loads(line) for line in original_sidecar.splitlines()]
+        assert len(saved) == num_failures
+        assert all(all(row[key] == value for key, value in failure.items()) for row in saved)
+        assert output_path.read_bytes() == b""
+        online_path = output_path.with_stem("output_aggregate_metrics").with_suffix(".json")
+        if counted and not disable_aggregation:
+            assert orjson.loads(online_path.read_bytes())[0]["key_metrics"] == {"mean/reward": 0.0}
+        else:
+            assert not online_path.exists() and not metric_inputs
+
+        offline_path = await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(
+                input_glob=str(output_path),
+                output_jsonl_fpath=str(tmp_path / "merged.jsonl"),
+                count_failure_classes_as_zero=counted_classes,
+                disable_health_check=True,
+            )
+        )
+        if counted:
+            assert orjson.loads(offline_path.read_bytes())[0]["key_metrics"] == {"mean/reward": 0.0}
+            assert len(metric_inputs) == (1 if disable_aggregation else 2)
+            for inputs in metric_inputs:
+                assert len(inputs) == num_failures
+                assert all(row["reward"] == 0.0 and row["mask_sample"] is False for row in inputs)
+        else:
+            assert offline_path is None and not metric_inputs
+        assert sidecar_path.read_bytes() == original_sidecar
+        assert output_path.read_bytes() == (tmp_path / "merged.jsonl").read_bytes() == b""
+
     async def test_run_from_config_fails_when_no_rollout_produced_a_result(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
     ) -> None:
@@ -1209,7 +1388,14 @@ class TestRolloutCollection:
 
         mock_server_client = MagicMock()
         mock_server_client.post = AsyncMock(return_value=response)
-        mock_server_client.global_config_dict = OmegaConf.create({"my_agent": {"responses_api_agents": {"impl": {}}}})
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                "my_agent": {"responses_api_agents": {"impl": {}}},
+                "my_environment_server": {
+                    "environment_servers": {"legacy_agent": {"agent_server": {"name": "my_agent"}}}
+                },
+            }
+        )
         monkeypatch.setattr(
             nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: mock_server_client
         )
@@ -1222,6 +1408,64 @@ class TestRolloutCollection:
         assert result == {"response": {}}
         assert "_ng_rollout_latency_ms" not in result
 
+    async def test_run_examples_rejects_agent_fronted_by_several_environment_servers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A row routed by its agent fails before any dispatch when two environment servers name that agent."""
+        row = {AGENT_REF_KEY_NAME: {"name": "my_agent"}, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}
+        mock_server_client = MagicMock()
+        mock_server_client.post = AsyncMock()
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                "my_agent": {"responses_api_agents": {"impl": {}}},
+                "my_legacy_server": {"environment_servers": {"legacy_agent": {"agent_server": {"name": "my_agent"}}}},
+                "my_native_server": {
+                    "environment_servers": {"single_agent_turn": {"agent_server": {"name": "my_agent"}}}
+                },
+            }
+        )
+        monkeypatch.setattr(
+            nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: mock_server_client
+        )
+
+        with pytest.raises(AmbiguousEnvironmentServerError, match="my_legacy_server.*my_native_server"):
+            next(RolloutCollectionHelper().run_examples([row]))
+        mock_server_client.post.assert_not_awaited()
+
+    async def test_run_examples_allows_several_servers_for_an_agent_no_row_routes_by(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Twin servers for one agent are valid; only rows that route by that agent need a single server."""
+        row = {AGENT_REF_KEY_NAME: {"name": "my_agent"}, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}
+        response = MagicMock()
+        response.status = 200
+        mock_server_client = MagicMock()
+        mock_server_client.post = AsyncMock(return_value=response)
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                "my_agent": {"responses_api_agents": {"impl": {}}},
+                "other_agent": {"responses_api_agents": {"impl": {}}},
+                "my_environment_server": {
+                    "environment_servers": {"legacy_agent": {"agent_server": {"name": "my_agent"}}}
+                },
+                "other_legacy_server": {
+                    "environment_servers": {"legacy_agent": {"agent_server": {"name": "other_agent"}}}
+                },
+                "other_native_server": {
+                    "environment_servers": {"single_agent_turn": {"agent_server": {"name": "other_agent"}}}
+                },
+            }
+        )
+        monkeypatch.setattr(
+            nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: mock_server_client
+        )
+        monkeypatch.setattr(nemo_gym.rollout_collection, "raise_for_status", AsyncMock())
+        monkeypatch.setattr(nemo_gym.rollout_collection, "get_response_json", AsyncMock(return_value={"response": {}}))
+
+        await next(RolloutCollectionHelper().run_examples([row]))
+
+        assert mock_server_client.post.await_args.kwargs["server_name"] == "my_environment_server"
+
     async def test_run_examples_with_metadata_carries_rollout_latency_alongside_result(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1232,7 +1476,14 @@ class TestRolloutCollection:
 
         mock_server_client = MagicMock()
         mock_server_client.post = AsyncMock(return_value=response)
-        mock_server_client.global_config_dict = OmegaConf.create({"my_agent": {"responses_api_agents": {"impl": {}}}})
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                "my_agent": {"responses_api_agents": {"impl": {}}},
+                "my_environment_server": {
+                    "environment_servers": {"legacy_agent": {"agent_server": {"name": "my_agent"}}}
+                },
+            }
+        )
         monkeypatch.setattr(
             nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: mock_server_client
         )
@@ -1324,12 +1575,14 @@ class TestRolloutCollection:
         assert "judge 503" in printed
         assert "Rollouts missing from the score: 1 of 2 materialized" in printed
 
+    @pytest.mark.parametrize("count_failures_as_zero", [False, True])
     async def test_run_from_config_reports_coverage_against_the_materialized_input_on_resume(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         empty_global_config: MagicMock,
+        count_failures_as_zero: bool,
     ) -> None:
         """A resumed hop dispatches little and can still be missing rollouts from earlier hops."""
         output_jsonl_fpath = tmp_path / "output.jsonl"
@@ -1364,12 +1617,18 @@ class TestRolloutCollection:
             output_jsonl_fpath=str(output_jsonl_fpath),
             resume_from_cache=True,
             disable_health_check=True,
+            require_complete=True,
+            count_failure_classes_as_zero=[AGENT_RUN_ERROR_FAILURE_CLASS] if count_failures_as_zero else [],
         )
-        await Helper().run_from_config(config)
+        with pytest.raises(RuntimeError, match="EVAL FAILED: 2/3 samples completed"):
+            await Helper().run_from_config(config)
 
         printed = capsys.readouterr().out
-        assert "Rollouts missing from the score: 1 of 3 materialized" in printed
-        assert "Metrics cover: 2 of 3 rollouts" in printed
+        if count_failures_as_zero:
+            assert "Counting 1 failure row(s) as scored zeros" in printed
+        else:
+            assert "Rollouts missing from the score: 1 of 3 materialized" in printed
+            assert "Metrics cover: 2 of 3 rollouts" in printed
 
     def test_preprocess_rows_with_prompt_config(self, tmp_path: Path) -> None:
         """prompt_config builds responses_create_params.input from template."""
@@ -2693,6 +2952,19 @@ class TestRolloutCollection:
 
         mock_server_client = MagicMock()
         mock_server_client.post = AsyncMock(return_value=mock_response)
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                name: block
+                for agent in ("agent_a", "agent_b", "my_agent")
+                for name, block in (
+                    (agent, {"responses_api_agents": {"impl": {}}}),
+                    (
+                        f"{agent}_environment_server",
+                        {"environment_servers": {"legacy_agent": {"agent_server": {"name": agent}}}},
+                    ),
+                )
+            }
+        )
 
         monkeypatch.setattr(
             nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: mock_server_client
@@ -2771,6 +3043,19 @@ class TestRolloutCollection:
         mock_response.status = 200
 
         mock_server_client = MagicMock()
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                name: block
+                for agent in ("agent_a", "agent_b", "my_agent")
+                for name, block in (
+                    (agent, {"responses_api_agents": {"impl": {}}}),
+                    (
+                        f"{agent}_environment_server",
+                        {"environment_servers": {"legacy_agent": {"agent_server": {"name": agent}}}},
+                    ),
+                )
+            }
+        )
         mock_server_client.post = AsyncMock(return_value=mock_response)
         monkeypatch.setattr(
             nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: mock_server_client
@@ -2796,6 +3081,19 @@ class TestRolloutCollection:
         mock_response.status = 200
 
         mock_server_client = MagicMock()
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                name: block
+                for agent in ("agent_a", "agent_b", "my_agent")
+                for name, block in (
+                    (agent, {"responses_api_agents": {"impl": {}}}),
+                    (
+                        f"{agent}_environment_server",
+                        {"environment_servers": {"legacy_agent": {"agent_server": {"name": agent}}}},
+                    ),
+                )
+            }
+        )
         mock_server_client.post = AsyncMock(return_value=mock_response)
         monkeypatch.setattr(
             nemo_gym.rollout_collection, "setup_server_client_utils", lambda *args, **kwargs: mock_server_client
@@ -2828,7 +3126,7 @@ class TestRolloutCollection:
 
         # Return different responses per agent based on server_name
         async def mock_post(server_name, **kwargs):
-            agg = agg_a if server_name == "agent_a" else agg_b
+            agg = agg_a if server_name == "agent_a_environment_server" else agg_b
             resp = AsyncMock()
             resp.raise_for_status = MagicMock()
             resp.read = AsyncMock(return_value=orjson.dumps(agg.model_dump()))
@@ -2836,6 +3134,19 @@ class TestRolloutCollection:
             return resp
 
         mock_server_client = MagicMock()
+        mock_server_client.global_config_dict = OmegaConf.create(
+            {
+                name: block
+                for agent in ("agent_a", "agent_b", "my_agent")
+                for name, block in (
+                    (agent, {"responses_api_agents": {"impl": {}}}),
+                    (
+                        f"{agent}_environment_server",
+                        {"environment_servers": {"legacy_agent": {"agent_server": {"name": agent}}}},
+                    ),
+                )
+            }
+        )
         mock_server_client.post = AsyncMock(side_effect=mock_post)
 
         monkeypatch.setattr(
@@ -3787,12 +4098,22 @@ class TestFanOut:
         mock_client = MagicMock()
         mock_client.post = fake_post
         mock_client.global_config_dict = OmegaConf.create(
-            {name: {"responses_api_agents": {"impl": {}}} for name in ("shared_agent_a", "shared_agent_b")}
+            {
+                name: block
+                for agent in ("shared_agent_a", "shared_agent_b")
+                for name, block in (
+                    (agent, {"responses_api_agents": {"impl": {}}}),
+                    (
+                        f"{agent}_environment_server",
+                        {"environment_servers": {"legacy_agent": {"agent_server": {"name": agent}}}},
+                    ),
+                )
+            }
         )
         monkeypatch.setattr(nemo_gym.rollout_collection, "setup_server_client_utils", lambda *a, **k: mock_client)
         for fut in RolloutCollectionHelper().run_examples(rows):
             await fut
-        assert sorted(posted) == ["shared_agent_a", "shared_agent_b"]
+        assert sorted(posted) == ["shared_agent_a_environment_server", "shared_agent_b_environment_server"]
 
     def test_fan_out_keys_match_data_side_name_and_win_over_agent_map(self, tmp_path) -> None:
         """fan_out keys match the name the DATA carries (pre-override); its targets are final,
@@ -3909,6 +4230,9 @@ class TestTaskSourcePreprocess:
             {
                 "math_rs": {"resources_servers": {"impl": {}}},
                 "math_agent": {"responses_api_agents": {"impl": {"resources_server": {"name": "math_rs"}}}},
+                "math_environment_server": {
+                    "environment_servers": {"legacy_agent": {"agent_server": {"name": "math_agent"}}}
+                },
             }
         )
 
@@ -4045,3 +4369,99 @@ class TestPreprocessExamples:
     def test_validates_knobs_like_the_cli(self) -> None:
         with pytest.raises(ValueError, match="empty list"):
             RolloutCollectionHelper().preprocess_examples([self._ts_row()], fan_out={"math": []})
+
+
+class TestMaskingStepMetrics:
+    """Progress accounting covers persisted rollouts; dropped attempts are counted apart."""
+
+    def test_a_healthy_run_adds_no_keys(self) -> None:
+        assert _masking_step_metrics("my_agent", Counter({"reward": 2.0, "count": 4}), Counter()) == {}
+
+    def test_masked_rollouts_report_their_share_and_the_score_without_them(self) -> None:
+        # 10 persisted, 2 masked; the 8 unmasked ones scored 4.0 in total.
+        metrics = _masking_step_metrics("my_agent", Counter({"reward": 4.0, "count": 8, "masked": 2}), Counter())
+
+        assert metrics == {
+            "progress/my_agent/masked_pct": 20.0,
+            "progress/my_agent/reward_unmasked": 50.0,
+        }
+
+    def test_every_persisted_rollout_masked_publishes_no_score(self) -> None:
+        """No unmasked rollout means no honest average to publish."""
+        assert _masking_step_metrics("my_agent", Counter({"masked": 6}), Counter()) == {
+            "progress/my_agent/masked_pct": 100.0
+        }
+
+    def test_failed_and_omitted_attempts_do_not_enter_the_quality_average(self) -> None:
+        """A sidecar row and a kill-shaped one are counted, never averaged as a zero."""
+        metrics = _masking_step_metrics(
+            "my_agent",
+            Counter({"reward": 4.0, "count": 4}),
+            Counter({"failed": 3, "omitted": 2}),
+        )
+
+        assert metrics == {
+            "progress/my_agent/reward_unmasked": 100.0,
+            "progress/my_agent/failed": 3,
+            "progress/my_agent/omitted": 2,
+        }
+
+
+class TestAnAgentThatOnlyEverFails:
+    """The wiring case: a total failure must not fall out of the export.
+
+    `_masking_step_metrics` is correct on its own Counters; what this covers is the loop
+    that feeds it. An agent whose every request returns no result never lands in
+    `agent_name_to_counts`, so iterating that dict would drop exactly the agent whose
+    failure the series exists to surface.
+    """
+
+    def _exported_agents(self, scored: dict, dropped: dict) -> set:
+        """Reproduce the export loop's selection over the two counter dicts."""
+        agent_name_to_scored = defaultdict(Counter, {k: Counter(v) for k, v in scored.items()})
+        agent_name_to_dropped = defaultdict(Counter, {k: Counter(v) for k, v in dropped.items()})
+
+        step_metrics: dict = {}
+        for agent_name in sorted(agent_name_to_scored.keys() | agent_name_to_dropped.keys()):
+            step_metrics.update(
+                _masking_step_metrics(
+                    agent_name,
+                    agent_name_to_scored.get(agent_name, Counter()),
+                    agent_name_to_dropped.get(agent_name, Counter()),
+                )
+            )
+        return {key.split("/")[1] for key in step_metrics}
+
+    def test_an_agent_with_no_successful_result_still_reports_its_failures(self) -> None:
+        exported = self._exported_agents(
+            scored={"healthy_agent": {"reward": 3.0, "count": 4}},
+            dropped={"broken_agent": {"failed": 4}},
+        )
+
+        assert "broken_agent" in exported
+
+    def test_the_healthy_agent_is_not_lost_in_the_process(self) -> None:
+        exported = self._exported_agents(
+            scored={"healthy_agent": {"reward": 3.0, "count": 4, "masked": 1}},
+            dropped={"broken_agent": {"failed": 4}},
+        )
+
+        assert exported == {"healthy_agent", "broken_agent"}
+
+    def test_a_run_with_nothing_wrong_still_exports_nothing(self) -> None:
+        """The series stays empty on a healthy run, as before."""
+        assert self._exported_agents(scored={"healthy_agent": {"reward": 3.0, "count": 4}}, dropped={}) == set()
+
+    def test_the_counters_are_not_grown_by_being_read(self) -> None:
+        agent_name_to_scored: dict = defaultdict(Counter, {"healthy_agent": Counter({"count": 1})})
+        agent_name_to_dropped: dict = defaultdict(Counter, {"broken_agent": Counter({"failed": 1})})
+
+        for agent_name in sorted(agent_name_to_scored.keys() | agent_name_to_dropped.keys()):
+            _masking_step_metrics(
+                agent_name,
+                agent_name_to_scored.get(agent_name, Counter()),
+                agent_name_to_dropped.get(agent_name, Counter()),
+            )
+
+        assert set(agent_name_to_scored) == {"healthy_agent"}
+        assert set(agent_name_to_dropped) == {"broken_agent"}

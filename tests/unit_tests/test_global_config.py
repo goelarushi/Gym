@@ -28,6 +28,7 @@ from nemo_gym import CACHE_DIR, NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME, RESULTS_DIR, 
 from nemo_gym._config_aliases import LEGACY_AGENT_ALIASES, LEGACY_CONFIG_PATH_ALIASES
 from nemo_gym.config_types import (
     AgentCompositionError,
+    AgentWithoutEnvironmentServerError,
     AlmostServerError,
     ConfigError,
     ConfigMissingValuesError,
@@ -39,6 +40,7 @@ from nemo_gym.config_types import (
     UnsupportedAgentPairingError,
     UnsupportedModelPairingError,
     WANDBConfig,
+    is_almost_server,
 )
 from nemo_gym.global_config import (
     ALLOW_UNSUPPORTED_PAIRING_ENV_VAR_NAME,
@@ -713,6 +715,12 @@ contested: second_inner
                             }
                         }
                     },
+                    "agent_name_environment_server": {
+                        "environment_servers": {"legacy_agent": {"agent_server": {"name": "agent_name"}}}
+                    },
+                    "explicit_agent_name_environment_server": {
+                        "environment_servers": {"legacy_agent": {"agent_server": {"name": "explicit_agent_name"}}}
+                    },
                 }
             )
         )
@@ -773,6 +781,9 @@ contested: second_inner
                             }
                         }
                     },
+                    "agent_name_environment_server": {
+                        "environment_servers": {"legacy_agent": {"agent_server": {"name": "agent_name"}}}
+                    },
                 }
             )
             return lambda: fn(config_dict)
@@ -807,6 +818,9 @@ contested: second_inner
                             "domain": "other",
                         }
                     }
+                },
+                "agent_name_environment_server": {
+                    "environment_servers": {"legacy_agent": {"agent_server": {"name": "agent_name"}}}
                 },
                 "disallowed_ports": [11000, 12345, 123456],
             }
@@ -846,6 +860,9 @@ contested: second_inner
                                 },
                             }
                         }
+                    },
+                    "agent_name_environment_server": {
+                        "environment_servers": {"legacy_agent": {"agent_server": {"name": "agent_name"}}}
                     },
                 }
             )
@@ -904,6 +921,9 @@ contested: second_inner
                             }
                         }
                     },
+                    "agent_name_environment_server": {
+                        "environment_servers": {"legacy_agent": {"agent_server": {"name": "agent_name"}}}
+                    },
                 }
             )
             return lambda: fn(config_dict)
@@ -951,6 +971,9 @@ contested: second_inner
                                 "domain": "other",
                             }
                         }
+                    },
+                    "agent_name_environment_server": {
+                        "environment_servers": {"legacy_agent": {"agent_server": {"name": "agent_name"}}}
                     },
                 }
             )
@@ -1395,6 +1418,9 @@ contested: second_inner
                             }
                         }
                     },
+                    "test_agent_environment_server": {
+                        "environment_servers": {"legacy_agent": {"agent_server": {"name": "test_agent"}}}
+                    },
                 }
             )
             return lambda: fn(config_dict)
@@ -1408,6 +1434,18 @@ contested: second_inner
         assert isinstance(exc_info.value, ConfigError)
         # Diagnostics must stay off stdout, which carries the `--json` payload.
         assert all(call.kwargs.get("file") is sys.stderr for call in rich_print_mock.call_args_list)
+
+    def test_environment_server_is_recognized_as_an_almost_server(self) -> None:
+        config = DictConfig(
+            {
+                "environment_servers": {
+                    "first": {"entrypoint": "first.py"},
+                    "second": {"entrypoint": "second.py"},
+                }
+            }
+        )
+
+        assert is_almost_server(config) is True
 
     def test_almost_servers_error_flag_bypasses_value_error(self, monkeypatch: MonkeyPatch) -> None:
         """
@@ -1453,6 +1491,9 @@ contested: second_inner
                                 ],
                             }
                         }
+                    },
+                    "test_agent_environment_server": {
+                        "environment_servers": {"legacy_agent": {"agent_server": {"name": "test_agent"}}}
                     },
                 }
             )
@@ -1985,6 +2026,69 @@ class TestConfigLoadErrors:
         config = DictConfig({"my_server": {"resources_servers": {"x": {"entrypoint": "app.py", "domain": "other"}}}})
         parser.raise_on_no_server_instances(config)
 
+    def test_config_without_environment_server_is_rejected(self) -> None:
+        # A pre-migration config would otherwise run, silently dispatching straight to the agent.
+        parser = GlobalConfigDictParser()
+        config = DictConfig(
+            {
+                "mcqa": {"resources_servers": {"mcqa": {"entrypoint": "app.py", "domain": "other"}}},
+                "mcqa_simple_agent": {
+                    "responses_api_agents": {
+                        "simple_agent": {
+                            "entrypoint": "app.py",
+                            "resources_server": {"type": "resources_servers", "name": "mcqa"},
+                        }
+                    }
+                },
+            }
+        )
+        with raises(AgentWithoutEnvironmentServerError) as exc_info:
+            parser._raise_on_agent_without_environment_server(config)
+        assert "mcqa_simple_agent" in str(exc_info.value)
+
+        config["mcqa_environment_server"] = {
+            "environment_servers": {
+                "legacy_agent": {
+                    "entrypoint": "app.py",
+                    "agent_server": {"type": "responses_api_agents", "name": "mcqa_simple_agent"},
+                }
+            }
+        }
+        parser._raise_on_agent_without_environment_server(config)
+
+    @mark.parametrize("resources_server", ["reasoning_gym", "tavily_search"])
+    def test_langchain_deepagents_configs_have_environment_servers(self, resources_server: str) -> None:
+        agent_name = f"{resources_server}_langchain_deepagents_agent_model_server"
+        config_path = (
+            Path(__file__).resolve().parents[2]
+            / "resources_servers"
+            / resources_server
+            / "configs"
+            / f"{agent_name}.yaml"
+        )
+        resolved = GlobalConfigDictParser().parse(
+            GlobalConfigDictParserConfig(
+                initial_global_config_dict=OmegaConf.merge(
+                    GlobalConfigDictParserConfig.NO_MODEL_GLOBAL_CONFIG_DICT,
+                    OmegaConf.load(config_path),
+                    {
+                        "tavily_api_key": "test-key",
+                        "exclude_domains_file_path": None,
+                        "search_judge_model_base_url": "http://example.invalid/v1",
+                        "search_judge_model_api_key": "test-key",
+                        "search_judge_model_name": "test-model",
+                    },
+                ),
+                skip_load_from_cli=True,
+                skip_load_from_dotenv=True,
+                offline=True,
+            )
+        )
+
+        environment = resolved[f"{agent_name}_environment_server"]["environment_servers"]["legacy_agent"]
+        assert environment["entrypoint"] == "app.py"
+        assert environment["agent_server"] == {"type": "responses_api_agents", "name": agent_name}
+
     def test_all_repo_configs_load_without_duplicate_keys(self) -> None:
         # OmegaConf.load (the loader `gym env start` actually uses) rejects duplicate YAML keys,
         # but a plain PyYAML parse silently allows them (last-writer-wins). A repeated key like a
@@ -2202,6 +2306,10 @@ class TestComposeUnboundAgent:
             "gpqa_mcqa_simple_agent": self._environment_agent("gpqa_mcqa_resources_server"),
             "gpqa_mcqa_resources_server": {
                 "resources_servers": {"mcqa": {"entrypoint": "app.py", "domain": "knowledge"}}
+            },
+            # Named after the environment, so composition swapping the agent leaves it alone.
+            "gpqa_mcqa_environment_server": {
+                "environment_servers": {"legacy_agent": {"agent_server": {"name": "gpqa_mcqa_simple_agent"}}}
             },
         }
         config.update(extra)
@@ -2711,6 +2819,9 @@ class TestComposeUnboundAgent:
                 instance: {
                     "_inherit_from": agent_type,
                     "responses_api_agents": {agent_type: {}},
+                },
+                f"{instance}_environment_server": {
+                    "environment_servers": {"legacy_agent": {"agent_server": {"name": instance}}}
                 },
             }
         )
