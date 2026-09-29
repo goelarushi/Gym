@@ -15,6 +15,7 @@ from environment_servers.usersim.app import (
     _configured_model_name,
     _create_usersim_generator,
     _is_retryable_dependency_error,
+    _to_responses_input_items,
 )
 from nemo_gym.base_environment_server import BaseEnvironmentServer
 from nemo_gym.config_types import AgentServerRef, ModelServerRef, ResourcesServerRef
@@ -156,6 +157,39 @@ def _runtime_descriptor() -> ProbeRuntimeDescriptor:
             },
         }
     )
+
+
+def test_tool_transcript_converts_to_responses_input_items() -> None:
+    assistant_items = _to_responses_input_items(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "safe_action", "arguments": '{"value":"x"}'},
+                }
+            ],
+        }
+    )
+    tool_items = _to_responses_input_items({"role": "tool", "content": '{"ok":true}', "tool_call_id": "call-1"})
+
+    assert assistant_items == [
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "safe_action",
+            "arguments": '{"value":"x"}',
+        }
+    ]
+    assert tool_items == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"ok":true}',
+        }
+    ]
 
 
 def _environment_server(*, token_capture: bool = False) -> tuple[UserSimEnvironmentServer, _Client]:

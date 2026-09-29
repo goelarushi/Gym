@@ -71,6 +71,13 @@ TOOL_TURN_INDEX_HEADER = "X-NeMo-Gym-Turn-Index"
 TOOL_CALL_INDEX_HEADER = "X-NeMo-Gym-Call-Index"
 
 
+def _merge_cookie_values(current: Mapping[str, str] | None, updates: Mapping[str, Any]) -> dict[str, str]:
+    """Merge aiohttp response morsels into a JSON-safe cookie mapping."""
+    merged = dict(current or {})
+    merged.update({str(name): str(getattr(value, "value", value)) for name, value in updates.items()})
+    return merged
+
+
 class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
@@ -333,7 +340,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         },
                     )
                     tool_output = (await api_response.content.read()).decode()
-                    resources_server_cookies = api_response.cookies
+                    resources_server_cookies = _merge_cookie_values(resources_server_cookies, api_response.cookies)
                     if collect_trajectory:
                         completed = 200 <= api_response.status < 400
                         tool_status = "completed" if completed else "failed"

@@ -505,10 +505,14 @@ class TestApp:
             if server_name == "model":
                 return _mock_response(next(model_payloads))
             assert (server_name, url_path) == ("resources", "/lookup")
-            return _mock_response(content='{"value":"ok"}')
+            resource_response = _mock_response(content='{"value":"ok"}')
+            cookie = MagicMock()
+            cookie.value = "updated-cookie"
+            resource_response.cookies = {"resources-session": cookie}
+            return resource_response
 
         server_client.post = AsyncMock(side_effect=post)
-        response, _, _, _ = await server._create_episode(
+        response, _, _, resource_cookies = await server._create_episode(
             NeMoGymResponseCreateParamsNonStreaming(
                 input="question",
                 tools=[
@@ -552,6 +556,7 @@ class TestApp:
         }
         final_request = server_client.post.await_args_list[2].kwargs["json"]
         assert final_request.tools == []
+        assert resource_cookies == {"resources-session": "updated-cookie"}
 
     @pytest.mark.parametrize(("capture_enabled", "override_responses"), ((False, False), (True, False), (True, True)))
     async def test_run_preserves_self_dispatch(self, capture_enabled: bool, override_responses: bool) -> None:

@@ -34,6 +34,7 @@ from nemo_gym.base_responses_api_agent import (
     AgentCloseSessionResponse,
     AgentSeedSessionRequest,
     AgentSeedSessionResponse,
+    AgentToolLoopPolicy,
 )
 from nemo_gym.config_types import (
     TOKEN_CAPTURE_PATH_SEGMENT,
@@ -234,7 +235,7 @@ class _ConversationBridge:
         if base_params is None:
             base_params = NeMoGymResponseCreateParamsNonStreaming(input=[])
         values = base_params.model_dump(mode="json", exclude_none=True)
-        values["input"] = [_to_responses_input(message) for message in messages]
+        values["input"] = [item for message in messages for item in _to_responses_input_items(message)]
         if max_tokens is not None:
             values["max_output_tokens"] = max_tokens
         if tools:
@@ -370,7 +371,7 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
                     tool_accesses=tool_accesses if alias == "assistant_model" else [],
                     sandbox_access=seed.sandbox_access if alias in {"user_model", "assistant_model"} else None,
                     tool_loop_policy=(
-                        seed.runtime_descriptor.loop_policy
+                        AgentToolLoopPolicy.model_validate(seed.runtime_descriptor.loop_policy.model_dump(mode="json"))
                         if alias == "assistant_model" and seed.runtime_descriptor is not None
                         else None
                     ),
@@ -705,7 +706,7 @@ def _agent_observations(source: str, trajectory_data: Any) -> AgentObservationBu
     )
 
 
-def _to_responses_input(message: Any) -> dict[str, Any]:
+def _to_responses_input_items(message: Any) -> list[dict[str, Any]]:
     if hasattr(message, "model_dump"):
         value = message.model_dump(mode="json", exclude_none=True)
     elif isinstance(message, Mapping):
@@ -713,9 +714,34 @@ def _to_responses_input(message: Any) -> dict[str, Any]:
     else:
         value = {"role": getattr(message, "role"), "content": getattr(message, "content", "")}
     role = getattr(value.get("role"), "value", value.get("role"))
+    if role == "tool":
+        return [
+            {
+                "type": "function_call_output",
+                "call_id": value["tool_call_id"],
+                "output": value.get("content", ""),
+            }
+        ]
+    if role == "assistant" and value.get("tool_calls"):
+        items = []
+        if value.get("content"):
+            items.append({"type": "message", "role": role, "content": value["content"]})
+        for call in value["tool_calls"]:
+            function = call.get("function")
+            if not isinstance(function, Mapping):
+                raise ValueError("Assistant tool call must contain a function mapping")
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": function["name"],
+                    "arguments": function.get("arguments", "{}"),
+                }
+            )
+        return items
     if role not in {"system", "developer", "user", "assistant"}:
         raise NotImplementedError(f"UserSim message role {role!r} is not supported")
-    return {"type": "message", "role": role, "content": value.get("content", "")}
+    return [{"type": "message", "role": role, "content": value.get("content", "")}]
 
 
 def _to_responses_tool(tool: Any) -> dict[str, Any]:
