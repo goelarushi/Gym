@@ -62,7 +62,6 @@ Configure an OpenAI-compatible endpoint in a local repository-root `env.yaml`:
 policy_base_url: https://your-endpoint.example.com/v1
 policy_api_key: ${oc.env:POLICY_API_KEY}
 policy_model_name: your-model-name
-policy_uses_reasoning_parser: true
 ```
 
 Export the referenced secret without committing it:
@@ -74,8 +73,8 @@ export POLICY_API_KEY="<your-api-key>"
 The example uses this endpoint for all simulation roles and tool-simulation calls. Most users can keep this
 default. If you need different endpoints or models for individual roles, see
 `resources_servers/usersim/configs/usersim.yaml`.
-Set `policy_uses_reasoning_parser` according to the selected model; use `false` for a model that does not return
-separate reasoning content.
+The rollout commands below enable the reasoning parser. Change the override to `false` for a model that does
+not return separate reasoning content.
 
 ## Prepare the persona panel
 
@@ -123,6 +122,7 @@ gym eval run \
   --output results/usersim/rollouts.jsonl \
   --limit 1 \
   --num-repeats 1 \
+  +policy_uses_reasoning_parser=true \
   ++usersim_environment.environment_servers.usersim.max_turns=2 \
   ++observability_enabled=true \
   ++model_call_capture_dir="${capture_dir}"
@@ -233,6 +233,7 @@ gym eval run \
   --split benchmark \
   --output results/usersim/all-probes.jsonl \
   --num-repeats 1 \
+  +policy_uses_reasoning_parser=true \
   ++observability_enabled=true \
   ++model_call_capture_dir="${capture_dir}"
 ```
