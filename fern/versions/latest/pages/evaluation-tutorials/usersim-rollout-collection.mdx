@@ -35,8 +35,8 @@ probes. The suite demonstrates and tests the integration.
 
 <Note>
 To run the tutorial, you only need to configure a model endpoint and run the preparation and evaluation
-commands. You do not need to understand the internal four-Agent topology. The optional architecture section
-later on explains it for readers who want to customize models, roles, or observability.
+commands. You do not need to understand the internal two-Agent topology or support-model routing. The optional
+architecture section later on explains it for readers who want to customize models, roles, or observability.
 </Note>
 
 <Info>
@@ -70,9 +70,9 @@ Export the referenced secret without committing it:
 export POLICY_API_KEY="<your-api-key>"
 ```
 
-The example uses this endpoint for all simulation roles and tool-simulation calls. Most users can keep this
-default. If you need different endpoints or models for individual roles, see
-`resources_servers/usersim/configs/usersim.yaml`.
+The example uses this endpoint for both participant roles and, by default, for support and tool-simulation
+calls. Most users can keep this default. If you need a different support endpoint or model, override the
+`support_model_*` settings defined in `resources_servers/usersim/configs/usersim.yaml`.
 The rollout commands below enable the reasoning parser. Change the override to `false` for a model that does
 not return separate reasoning content.
 
@@ -133,26 +133,28 @@ the limit only after the smoke rollout completes. Here, `max_turns=2` bounds Use
 rounds. It does not bound the invocation ledger to two entries: Judge and Summary activations are recorded
 separately, and UserSim can invoke those support roles multiple times within a round.
 
-## Understand the four-Agent topology (optional)
+## Understand the two-Agent topology (optional)
 
 You can run the workflow without knowing this architecture. It becomes relevant when you want to assign
 different models to roles, customize Agent behavior, or interpret low-level invocation traces.
 
-The Environment Server coordinates four roles:
+The Environment Server coordinates four semantic roles:
 
 - The **User Agent** produces the simulated user's messages.
 - The **Assistant Agent** produces the system-under-test responses and receives probe-specific tool access.
-- The **Judge Agent** performs UserSim's in-conversation semantic checks.
-- The **Summary Agent** compresses conversation context when UserSim requests it.
+- The **Judge support model** performs UserSim's in-conversation semantic checks.
+- The **Summary support model** compresses conversation context when UserSim requests it.
 
-Each role activation is a separate Responses API request to that role's Agent Server. This does not mean that
-four responses are returned to the simulated user at once: the Environment Server invokes the roles as needed
-and in order during the conversation. The four Agents can use separate Model Servers, but the tutorial's default
-configuration points them at the same endpoint.
+Each role activation is a separate Responses API request. User and Assistant activations go through their Agent
+Servers; Judge and Summary activations go directly from the Environment Server to a Model Server because they do
+not need tools, sandboxes, or an Agent loop. This does not mean that four responses are returned to the simulated
+user at once: the Environment Server invokes the roles as needed and in order during the conversation. The
+tutorial routes User and Assistant through `policy_model`, while Judge and Summary use `support_model`.
+The support server defaults to the same upstream endpoint as the policy server.
 
 Persisted episode invocations use the semantic `user`, `assistant`, `judge`, and `summary` roles. The Resources
 Server separately owns the prepared panel, probe tools and state, tool-result synthesis, and final verification.
-Its `probe_scorer_model` reuses `judge_model` by default.
+Its `probe_scorer_model` also references `support_model`.
 
 Task rows can provide optional per-role request defaults through `responses_create_params`. The Environment
 Server supplies the current conversation as each activation's Responses API `input`; the task does not contain
