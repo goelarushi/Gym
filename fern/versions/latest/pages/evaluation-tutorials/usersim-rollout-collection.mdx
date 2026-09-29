@@ -67,7 +67,6 @@ policy_model_name: your-policy-model
 support_model_base_url: https://your-support-endpoint.example.com/v1
 support_model_api_key: ${oc.env:SUPPORT_MODEL_API_KEY}
 support_model_name: your-structured-output-model
-support_model_uses_reasoning_parser: false
 ```
 
 Export the referenced secrets without committing them:
@@ -80,8 +79,8 @@ export SUPPORT_MODEL_API_KEY="<your-api-key>"
 User and Assistant share `policy_model`; Judge, Summary, probe scoring, and tool-result simulation share
 `support_model`. The two server instances may point to the same upstream model, but a separate support model
 that reliably honors JSON-schema response formats avoids coupling structured evaluation to participant-model
-reasoning behavior. The rollout commands below enable reasoning parsing only for `policy_model`; the support
-parser remains disabled by the explicit setting above.
+reasoning behavior. The rollout commands below enable reasoning parsing for `policy_model` and explicitly
+disable it for `support_model` (which is also the default).
 
 ## Prepare the persona panel
 
@@ -130,6 +129,7 @@ gym eval run \
   --limit 1 \
   --num-repeats 1 \
   +policy_uses_reasoning_parser=true \
+  +support_model_uses_reasoning_parser=false \
   ++usersim_environment.environment_servers.usersim.max_turns=2 \
   ++observability_enabled=true \
   ++model_call_capture_dir="${capture_dir}"
@@ -252,6 +252,7 @@ gym eval run \
   --output results/usersim/all-probes.jsonl \
   --num-repeats 1 \
   +policy_uses_reasoning_parser=true \
+  +support_model_uses_reasoning_parser=false \
   ++observability_enabled=true \
   ++model_call_capture_dir="${capture_dir}"
 ```
