@@ -17,7 +17,11 @@ from pathlib import Path
 import pytest
 from omegaconf import DictConfig
 
-from nemo_gym.cli.eval import _validate_prepared_split_file_exists, _validate_split_datasets_declared
+from nemo_gym.cli.eval import (
+    _data_processor_mode_for_split,
+    _validate_prepared_split_file_exists,
+    _validate_split_datasets_declared,
+)
 from nemo_gym.config_types import ConfigError, ResponsesAPIAgentServerInstanceConfig
 
 
@@ -102,3 +106,12 @@ class TestValidatePreparedSplitFileExists:
         missing_dir = tmp_path / "does_not_exist"
         with pytest.raises(ConfigError, match=r"none"):
             _validate_prepared_split_file_exists(missing_dir / "train.jsonl", "train", missing_dir)
+
+
+@pytest.mark.parametrize("split", ["train", "validation", "benchmark"])
+def test_standard_splits_use_train_preparation(split: str) -> None:
+    assert _data_processor_mode_for_split(split) == "train_preparation"
+
+
+def test_example_split_uses_example_validation() -> None:
+    assert _data_processor_mode_for_split("example") == "example_validation"
