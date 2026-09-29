@@ -15,7 +15,7 @@ By the end of this tutorial, you will:
 1. Prepare a reusable population of simulated users.
 2. Run one multi-turn conversation against your model endpoint.
 3. Inspect the conversation, score, and underlying model calls.
-4. Optionally expand the run across 13 included evaluation scenarios.
+4. Optionally expand the run across 14 included evaluation scenarios.
 
 ## Understand the workflow
 
@@ -30,7 +30,7 @@ At a conceptual level, a UserSim rollout has four stages:
 4. **Verify the result:** Gym stores the complete episode and UserSim's probe-specific evidence and score.
 
 In this tutorial, a **task** specifies what to simulate, and an **episode** is one attempt to run that task. The
-included UserSim environment contains an example suite with one task for each of UserSim's 13 first-party
+included UserSim environment contains an example suite with one task for each of UserSim's 14 first-party
 probes. The suite demonstrates and tests the integration.
 
 <Note>
@@ -114,7 +114,7 @@ jq . resources_servers/usersim/data/example.jsonl
 
 ## Collect one rollout
 
-`--environment usersim --split benchmark` selects the included 13-task example suite described above. The
+`--environment usersim --split benchmark` selects the included 14-task example suite described above. The
 internal split remains named `benchmark` because that is the dataset type consumed by `gym eval`, but UserSim
 is an environment rather than a benchmark. Start with only the first task and one repeat:
 
@@ -243,7 +243,7 @@ The concrete Pydantic contracts are defined in
 
 ## Run more probes
 
-After inspecting the smoke rollout, remove `--limit 1` to run the 13 prepared examples:
+After inspecting the smoke rollout, remove `--limit 1` to run the 14 prepared examples:
 
 ```bash
 gym eval run \
