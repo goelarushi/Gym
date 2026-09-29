@@ -56,25 +56,32 @@ source .venv/bin/activate
 Preparation runs the pinned UserSim revision in a preparation-only isolated environment. Runtime servers
 install the same revision into their own environments. Neither step modifies the Gym environment.
 
-Configure an OpenAI-compatible endpoint in a local repository-root `env.yaml`:
+Configure the participant policy model and structured-output support model in a local repository-root
+`env.yaml`:
 
 ```yaml
-policy_base_url: https://your-endpoint.example.com/v1
+policy_base_url: https://your-policy-endpoint.example.com/v1
 policy_api_key: ${oc.env:POLICY_API_KEY}
-policy_model_name: your-model-name
+policy_model_name: your-policy-model
+
+support_model_base_url: https://your-support-endpoint.example.com/v1
+support_model_api_key: ${oc.env:SUPPORT_MODEL_API_KEY}
+support_model_name: your-structured-output-model
+support_model_uses_reasoning_parser: false
 ```
 
-Export the referenced secret without committing it:
+Export the referenced secrets without committing them:
 
 ```bash
 export POLICY_API_KEY="<your-api-key>"
+export SUPPORT_MODEL_API_KEY="<your-api-key>"
 ```
 
-The example uses this endpoint for both participant roles and, by default, for support and tool-simulation
-calls. Most users can keep this default. If you need a different support endpoint or model, override the
-`support_model_*` settings defined in `resources_servers/usersim/configs/usersim.yaml`.
-The rollout commands below enable the reasoning parser. Change the override to `false` for a model that does
-not return separate reasoning content.
+User and Assistant share `policy_model`; Judge, Summary, probe scoring, and tool-result simulation share
+`support_model`. The two server instances may point to the same upstream model, but a separate support model
+that reliably honors JSON-schema response formats avoids coupling structured evaluation to participant-model
+reasoning behavior. The rollout commands below enable reasoning parsing only for `policy_model`; the support
+parser remains disabled by the explicit setting above.
 
 ## Prepare the persona panel
 
@@ -150,7 +157,8 @@ Servers; Judge and Summary activations go directly from the Environment Server t
 not need tools, sandboxes, or an Agent loop. This does not mean that four responses are returned to the simulated
 user at once: the Environment Server invokes the roles as needed and in order during the conversation. The
 tutorial routes User and Assistant through `policy_model`, while Judge and Summary use `support_model`.
-The support server defaults to the same upstream endpoint as the policy server.
+This tutorial configures separate upstream models, but both server instances can target one endpoint when that
+model supports both conversational reasoning and strict structured output.
 
 Persisted episode invocations use the semantic `user`, `assistant`, `judge`, and `summary` roles. The Resources
 Server separately owns the prepared panel, probe tools and state, tool-result synthesis, and final verification.
