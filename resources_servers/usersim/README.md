@@ -3,9 +3,9 @@
 This environment initializes one deterministic NeMo UserSim scenario at the
 beginning of each `UserSimEnvironmentServer` episode. The Resources Server
 loads a persona panel previously created by `usersim panel` during
-`gym eval prepare`, hosts episode-scoped simulated tools for agentic probes,
-and retains native verification evidence. It does not construct or sample the
-panel at runtime.
+`gym eval prepare`, resolves task inputs, and verifies the authoritative native
+UserSim result. It does not construct or sample the panel at runtime, create a
+second probe runtime, or expose probe tool endpoints.
 
 ## Environment initialization
 
@@ -95,31 +95,30 @@ outcome.
 multi-agent engine. Its native `UserSimEpisodeResponse` contains exactly one
 of `result` or `failure`. A successful result retains the verifier output,
 native UserSim result, and one ordered `UserSimInvocation` list for User,
-Assistant, judge, and summary calls owned by the Environment Server. Each
+Assistant, judge, summary, and tool-simulation calls owned by the Environment
+Server. Each
 invocation contains its semantic role, exact Responses API request and response, optional
 `AgentObservationBundle`, the environment `state_after` that activation, and
-an optional final `termination_reason`. Function calls and
-their model-visible results remain ordered inside `response.output`.
-Probe API-response calls are Resources Server implementation details and are
-retained with probe runtime evidence rather than added to this invocation list.
+an optional final `termination_reason`. The native UserSim result is
+authoritative for the complete conversation, including function calls and
+model-visible tool results.
 
 ## Probe tools and episode state
 
 NeMo UserSim selects any Assistant tool schemas required by the resolved probe.
-The Environment Server passes those schemas only to the Assistant Agent, which
-owns the model/tool iteration. Each selected tool is exposed through the
-standard Resources Server `POST /{tool_name}` route. The shared Resources
-session cookie selects that episode's allowlist, simulated state, and verifier
-evidence, so another episode cannot call or mutate those tools.
+The Environment Server passes those schemas to an Assistant Agent configured
+for one model activation. The Agent returns function calls without executing
+them. The Environment-owned native UserSim probe validates and executes those
+calls, appends tool results, and decides whether to invoke the Assistant again.
+The same probe instance therefore owns selection, mutable tool state, and
+native evidence for the full episode.
 
 The User and Assistant Agents share `policy_model`. The Environment Server
 routes UserSim's Judge and Summary calls directly to `support_model`, without
-creating support Agent sessions. Resources-owned tool-result synthesis and
-native probe scoring retain the purpose-specific `tool_simulation_model` and
-`probe_scorer_model` configuration fields, but both reference the same support
-Model Server. Its endpoint settings default to the policy settings and can be
-overridden independently. `/close_session` removes the resolved scenario and
-mutable runtime state.
+creating support Agent sessions. The Environment's `tool_simulation_model` and
+the Resources verifier's `probe_scorer_model` both reference `support_model` by
+default. Its endpoint settings default to the policy settings and can be
+overridden independently. `/close_session` removes the resolved scenario.
 
 ## Static and dynamic configuration
 
@@ -159,9 +158,8 @@ UserSim probe:
 - Identity: `identity_disclosure`
 
 The three probes that expose Assistant tools—`tool_calling`,
-`safety_agentic`, and `financial_services`—use the episode-scoped external
-runtime in the Resources Server. The remaining probes execute their native
-UserSim conversation shape through the Environment Server. Asset-backed probes
+`safety_agentic`, and `financial_services`—execute through the same native
+UserSim generator path as the remaining probes. Asset-backed probes
 derive their task from the selected persona and pinned UserSim assets; the
 dataset row only needs a stable locale, seed, and probe name. The
 `tool_calling` row additionally supplies its candidate tool schema.
@@ -180,6 +178,13 @@ helpfulness, accuracy, and coherence—as the scalar Gym reward. Conversation
 completion and any dedicated probe scorer remain prerequisites for receiving
 that quality reward. The complete `assistant_eval` and native scorer envelopes
 are retained in `verifier_data`.
+
+Verification also returns `mask_sample`, `failure_kind`, and `failure_reason`.
+Failures attributed to the simulated user, support models, scenario logic, or
+infrastructure are masked so they are not trained as Assistant-policy errors.
+Failures attributed to `assistant_model` remain unmasked. A probe-scorer or
+trajectory-evaluator execution error is also masked, while an ordinary
+probe-scorer rejection remains a valid zero-reward sample.
 
 ## Run
 
@@ -211,6 +216,7 @@ selected = [
 ```
 
 Use `{"assistant"}`, `{"user"}`, or both for `requested_roles`. Judge and
-Summary support-model calls use distinct roles, while API-response synthesis remains
-Resources-owned. Participant filtering provides the explicit per-invocation
-contract for downstream SFT, RL projection, or custom collation.
+Summary support-model calls use distinct roles, while API-response synthesis
+uses `tool_simulation`. Participant filtering provides the explicit
+per-invocation contract for downstream SFT, RL projection, or custom
+collation.

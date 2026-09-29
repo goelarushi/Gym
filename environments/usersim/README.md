@@ -4,6 +4,12 @@ This environment runs population-grounded, multi-turn user simulation with
 NeMo UserSim. It includes one example task for each first-party UserSim probe;
 the examples exercise the environment's supported interaction shapes.
 
+This implementation is the Environment-owned alternative to
+[Gym PR #3791](https://github.com/NVIDIA-NeMo/Gym/pull/3791). Both designs
+start from `ffrujeri/usersim-rollout-quickstart`; this version keeps the native
+UserSim generator as the sole probe and tool-loop owner instead of constructing
+a second external runtime in the Resources Server.
+
 Environment preparation delegates persona sampling to NeMo UserSim and treats
 the resulting panel Parquet as the immutable prepared artifact. Preparation
 runs the pinned UserSim package in its own isolated dependency environment, so
@@ -45,25 +51,29 @@ by a dataset row.
 
 `tool_calling`, `safety_agentic`, and `financial_services` expose
 probe-selected tool schemas to the Assistant Agent. The Agent owns model/tool
-iteration and invokes standard Resources Server `POST /{tool_name}` endpoints.
-The Resources Server owns the episode-scoped tool implementation, mutable
-state, and native verification evidence. All other probes execute their native
-UserSim conversation shape without Assistant tools.
+activation only: it returns function calls without executing them. The
+Environment-owned native UserSim probe consumes those calls, simulates the
+tool results, and invokes the Assistant again when the probe requires it. This
+keeps one probe instance and one native UserSim tool loop per episode. The
+Resources Server owns persona resolution and verification, not probe execution.
+All other probes execute their native UserSim conversation shape without
+Assistant tools.
 For `identity_disclosure`, the integration gives UserSim the Assistant's
 configured upstream model ID so the native probe can resolve and score the
 expected developer identity.
 
 The resulting ordered `result.invocations` retain User and Assistant Agent
-activations, Judge and Summary support-model calls, tool calls and results,
-post-activation state, and observations.
+activations plus Judge, Summary, and tool-simulation support-model calls.
+Tool calls and results are retained in UserSim's native conversation result;
+Agent observations cover only each single policy activation.
 
 The User and Assistant Agents share `policy_model`. The Environment Server
 routes UserSim's Judge and Summary calls directly to `support_model`, without
-creating support Agent sessions. Resources-owned tool-result synthesis and
-native probe scoring retain their purpose-specific `tool_simulation_model` and
-`probe_scorer_model` fields, but both reference the same support server. Its
-endpoint settings default to the standard policy settings and can be overridden
-independently.
+creating support Agent sessions. The Environment routes UserSim's
+`api_response_model` calls through its `tool_simulation_model` reference, while
+the Resources verifier uses `probe_scorer_model`; both references target
+`support_model` by default. Its endpoint settings default to the standard
+policy settings and can be overridden independently.
 
 After preparation:
 

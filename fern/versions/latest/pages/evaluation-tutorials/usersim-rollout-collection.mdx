@@ -147,21 +147,25 @@ different models to roles, customize Agent behavior, or interpret low-level invo
 The Environment Server coordinates four semantic roles:
 
 - The **User Agent** produces the simulated user's messages.
-- The **Assistant Agent** produces the system-under-test responses and receives probe-specific tool access.
+- The **Assistant Agent** performs one system-under-test model activation and returns text or function calls.
 - The **Judge support model** performs UserSim's in-conversation semantic checks.
 - The **Summary support model** compresses conversation context when UserSim requests it.
 
 Each role activation is a separate Responses API request. User and Assistant activations go through their Agent
 Servers; Judge and Summary activations go directly from the Environment Server to a Model Server because they do
-not need tools, sandboxes, or an Agent loop. This does not mean that four responses are returned to the simulated
+not need tools, sandboxes, or an Agent loop. For tool probes, the native UserSim probe executes the Assistant's
+function calls and decides whether to activate it again; the Assistant Agent does not run an independent tool loop.
+This does not mean that four responses are returned to the simulated
 user at once: the Environment Server invokes the roles as needed and in order during the conversation. The
 tutorial routes User and Assistant through `policy_model`, while Judge and Summary use `support_model`.
 This tutorial configures separate upstream models, but both server instances can target one endpoint when that
 model supports both conversational reasoning and strict structured output.
 
-Persisted episode invocations use the semantic `user`, `assistant`, `judge`, and `summary` roles. The Resources
-Server separately owns the prepared panel, probe tools and state, tool-result synthesis, and final verification.
-Its `probe_scorer_model` also references `support_model`.
+Persisted episode invocations use the semantic `user`, `assistant`, `judge`, `summary`, and `tool_simulation`
+roles. The Environment owns the one native UserSim probe and its tool state. The Resources Server owns the
+prepared panel, resolved task context, and final verification. Its `probe_scorer_model` references
+`support_model`; the Environment's `tool_simulation_model` uses that server for probes that synthesize API
+responses.
 
 Task rows can provide optional per-role request defaults through `responses_create_params`. The Environment
 Server supplies the current conversation as each activation's Responses API `input`; the task does not contain
@@ -212,14 +216,14 @@ jq '.result.invocations[] | {
 }' results/usersim/rollouts.jsonl
 ```
 
-`role` is one of `user`, `assistant`, `judge`, or `summary`. Internal UserSim model aliases and an
+`role` is one of `user`, `assistant`, `judge`, `summary`, or `tool_simulation`. Internal UserSim model aliases and an
 agent-versus-model executor label are intentionally not exposed. The `request` and `response` fields preserve
 the exact Responses API exchange for each Environment-owned activation.
 
 <Note>
 The final rollout is an episode response, not one flattened Assistant transcript. The invocation ledger records
-Environment-owned activations. Resources-owned tool-result synthesis and probe-specific verification calls
-remain in probe or verification evidence rather than appearing as Environment Agent activations.
+Environment-owned activations. Native probe tool calls and results remain in `usersim_result`, while
+probe-specific verification calls remain in verification evidence.
 </Note>
 
 The raw model-call capture shows Agent-internal policy steps that can outnumber Environment invocations:
@@ -257,5 +261,5 @@ gym eval run \
 ```
 
 The `tool_calling`, `safety_agentic`, and `financial_services` probes expose episode-scoped simulated tools to
-the Assistant Agent. The Resources Server verifies their tool evidence and dispatches the probe's native
-UserSim scorer when one applies.
+the Assistant Agent. UserSim's native probe loop executes those calls, and the Resources Server verifies the
+resulting native evidence and dispatches the probe's scorer when one applies.
