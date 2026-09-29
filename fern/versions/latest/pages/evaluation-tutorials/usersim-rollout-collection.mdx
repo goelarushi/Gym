@@ -183,6 +183,14 @@ jq '{
 }' results/usersim/rollouts.jsonl
 ```
 
+The scalar reward is UserSim's `assistant_quality`: the mean of normalized
+helpfulness, accuracy, and coherence scores from its trajectory evaluator.
+`reward_components` also contains every applicable normalized quality axis.
+The full `assistant_eval` cell, including judge reasoning, is retained under
+`verification.verifier_data`. A conversation must complete with both
+participants, and any probe-specific scorer must pass, before its quality
+score becomes the Gym reward.
+
 The ordered invocation ledger is the Environment Server's trajectory contract:
 
 ```bash
@@ -217,7 +225,7 @@ jq '.ng_model_call_capture, .ng_trajectory' results/usersim/rollouts.jsonl
 Use these layers for different questions:
 
 - `result.usersim_result`: UserSim's native conversation and outcome.
-- `result.verification`: scalar reward, reward components, and native scorer evidence.
+- `result.verification`: assistant-quality reward, normalized axes, and native scorer evidence.
 - `result.invocations`: ordered, role-attributed Environment activations.
 - `ng_model_call_capture`: underlying model calls, token usage, latency, and tool-call evidence.
 - `ng_trajectory`: normalized Gym observability when the participating Agent provides it.
