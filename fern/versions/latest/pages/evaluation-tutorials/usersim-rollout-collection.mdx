@@ -114,9 +114,8 @@ jq . resources_servers/usersim/data/example.jsonl
 
 ## Collect one rollout
 
-`--environment usersim --split benchmark` selects the included 14-task example suite described above. The
-internal split remains named `benchmark` because that is the dataset type consumed by `gym eval`, but UserSim
-is an environment rather than a benchmark. Start with only the first task and one repeat:
+`--environment usersim --split example` selects the included 14-task example suite described above. Start
+with only the first task and one repeat:
 
 ```bash
 mkdir -p results/usersim/model-calls
@@ -124,7 +123,7 @@ capture_dir="$(pwd)/results/usersim/model-calls"
 
 gym eval run \
   --environment usersim \
-  --split benchmark \
+  --split example \
   --output results/usersim/rollouts.jsonl \
   --limit 1 \
   --num-repeats 1 \
@@ -248,7 +247,7 @@ After inspecting the smoke rollout, remove `--limit 1` to run the 14 prepared ex
 ```bash
 gym eval run \
   --environment usersim \
-  --split benchmark \
+  --split example \
   --output results/usersim/all-probes.jsonl \
   --num-repeats 1 \
   +policy_uses_reasoning_parser=true \
