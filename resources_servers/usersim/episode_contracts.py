@@ -65,7 +65,7 @@ class UserSimProtocolConfig(BaseModel):
     user_language_min_letters: int = Field(8, ge=0)
     incremental_disclosure_ratio: float = Field(0.6, ge=0, le=1)
     persona_grounding_ratio: float = Field(1, ge=0, le=1)
-    context_compression: bool = True
+    context_compression: bool = False
     compression_window: int = Field(1, ge=1)
     store_reasoning: bool = True
     random_seed: int | None = None
@@ -96,12 +96,92 @@ class ResolvedUserSimContext(BaseModel):
     usersim_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 
+class AssistantToolLoopPolicy(BaseModel):
+    """Serializable assistant/tool-loop policy supplied by UserSim."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_round_mode: Literal["single", "multi"]
+    max_assistant_activations: int = Field(ge=1)
+    final_synthesis_without_tools: bool
+    single_user_turn: bool
+    assistant_error_behavior: Literal["fail_episode"]
+    tool_error_behavior: Literal["return_error_payload"]
+    max_tool_calls_per_turn: int | None = Field(default=None, ge=1)
+    max_tool_response_attempts: int = Field(ge=1)
+    assistant_resampling: bool
+
+
+class UserTurnPolicySnapshot(BaseModel):
+    """JSON-safe subset of UserSim's outer user-turn policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    context_compression: bool
+    wrap_up: bool
+    followup_anchor: str | None
+    allowed_phrases: list[str]
+    script_check_ignores: list[str]
+    check_opening: Literal["none"]
+
+
+class ProbeRuntimeDescriptor(BaseModel):
+    """Strict mirror of UserSim's externally hosted runtime descriptor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    probe_type: str
+    assistant_tools: list[dict[str, Any]]
+    allowed_tool_names: list[str]
+    initial_user_message: str | None
+    loop_policy: AssistantToolLoopPolicy
+    user_system_prompt: str
+    assistant_system_prompt: str
+    turn0_user_query_instruction: str | None
+    user_interaction_style: str
+    patience: float
+    user_turn_policy: UserTurnPolicySnapshot
+
+
 class UserSimSeedResponse(ResourcesSeedSessionResponse):
     """Return resources-session identity plus the resolved scenario."""
 
     scenario: UserSimScenario
     usersim_context: ResolvedUserSimContext
     assistant_tools: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_descriptor: ProbeRuntimeDescriptor | None = None
+
+
+class UserSimTranscriptSyncRequest(BaseModel):
+    """Synchronize the canonical transcript into the Resources-owned runtime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[dict[str, Any]]
+
+
+class UserSimRuntimeTurnRequest(BaseModel):
+    """Identify one semantic outer conversation turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    turn_idx: int = Field(ge=1)
+
+
+class UserSimFollowupInstructionsResponse(BaseModel):
+    """Probe-authored additions for one user follow-up activation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    instructions: list[str]
+
+
+class UserSimRuntimeBooleanResponse(BaseModel):
+    """Boolean result from a delegated runtime lifecycle hook."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: bool
 
 
 class UserSimSimulationResult(BaseModel):
@@ -163,6 +243,9 @@ class UserSimVerification(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reward: float
+    mask_sample: bool = False
+    failure_kind: str | None = None
+    failure_reason: str | None = None
     reward_components: dict[str, float]
     scenario_completed: bool
     verifier_data: dict[str, Any] = Field(default_factory=dict)

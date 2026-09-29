@@ -107,8 +107,7 @@ usersim_environment:
         user_language_min_letters: 8
         incremental_disclosure_ratio: 0.6
         persona_grounding_ratio: 1.0
-        context_compression: true
+        context_compression: false
         compression_window: 1
         store_reasoning: true
-        random_seed: 42
         verbosity: 1

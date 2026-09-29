@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pyarrow.parquet as pq
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from nemo_gym import WORKING_DIR
@@ -32,19 +32,22 @@ from nemo_gym.episode_types import (
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
-    NeMoGymResponseFunctionCallOutput,
-    NeMoGymResponseFunctionToolCall,
     NeMoGymResponseOutputMessage,
 )
 from nemo_gym.server_utils import SESSION_ID_KEY, get_response_json, raise_for_status
 from resources_servers.usersim.episode_contracts import (
+    ProbeRuntimeDescriptor,
     ResolvedUserSimContext,
+    UserSimFollowupInstructionsResponse,
+    UserSimRuntimeBooleanResponse,
+    UserSimRuntimeTurnRequest,
     UserSimSamplingRequest,
     UserSimScenario,
     UserSimSeedResponse,
     UserSimSimulationResult,
     UserSimTaskInput,
     UserSimTheme,
+    UserSimTranscriptSyncRequest,
     UserSimVerification,
     UserSimVerifyRequest,
 )
@@ -205,58 +208,14 @@ def _conversation_roles(result: UserSimSimulationResult) -> set[str]:
     }
 
 
-def _external_probe_transcript(
-    messages: list[dict[str, Any]],
-    invocations: Sequence[Any],
-) -> list[dict[str, Any]]:
-    """Replace collapsed Assistant turns with the Agent's full tool transcript."""
-    assistant_responses = iter(invocation.response for invocation in invocations if invocation.role == "assistant")
-    transcript: list[dict[str, Any]] = []
-    for message in messages:
-        if message.get("role") != "assistant":
-            transcript.append(message)
-            continue
-        response = next(assistant_responses, None)
-        if response is None:
-            transcript.append(message)
-            continue
-        converted = _response_output_messages(response)
-        transcript.extend(converted or [message])
-    return transcript
-
-
-def _response_output_messages(response: NeMoGymResponse) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    pending_calls: list[dict[str, Any]] = []
-
-    def flush_calls() -> None:
-        if pending_calls:
-            messages.append({"role": "assistant", "content": "", "tool_calls": list(pending_calls)})
-            pending_calls.clear()
-
-    for item in response.output:
-        if isinstance(item, NeMoGymResponseFunctionToolCall):
-            pending_calls.append(
-                {
-                    "id": item.call_id,
-                    "type": "function",
-                    "function": {"name": item.name, "arguments": item.arguments},
-                }
-            )
-            continue
-        flush_calls()
-        if isinstance(item, NeMoGymResponseFunctionCallOutput):
-            messages.append(
-                {
-                    "role": "tool",
-                    "content": item.output if isinstance(item.output, str) else json.dumps(item.output),
-                    "tool_call_id": item.call_id,
-                }
-            )
-        elif isinstance(item, NeMoGymResponseOutputMessage):
-            messages.append({"role": "assistant", "content": _output_message_text(item)})
-    flush_calls()
-    return messages
+def _simulation_infrastructure_failure(result: UserSimSimulationResult) -> str | None:
+    outcome = result.simulation_outcome
+    if str(outcome.get("status", "")).lower() != "failed":
+        return None
+    attribution = str(outcome.get("failure_attribution", "")).lower()
+    if attribution in {"assistant_model", "model_under_test"}:
+        return None
+    return str(outcome.get("failure_detail") or attribution or "UserSim simulation infrastructure failed")
 
 
 class _ResourcesModelFacade:
@@ -345,6 +304,9 @@ class UserSimResourcesServer(SimpleResourcesServer):
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
+        app.post("/runtime/transcript")(self.synchronize_runtime_transcript)
+        app.post("/runtime/followup_instructions")(self.runtime_followup_instructions)
+        app.post("/runtime/capitulation")(self.runtime_capitulation)
         app.post("/{tool_name}")(self.invoke_probe_tool)
         return app
 
@@ -466,12 +428,19 @@ class UserSimResourcesServer(SimpleResourcesServer):
         runtime = None
         if result.scenario.probe_type in TOOL_PROBES:
             runtime = self._create_probe_runtime(result.scenario, task)
+            descriptor = ProbeRuntimeDescriptor.model_validate((await runtime.descriptor()).to_dict())
             scenario = result.scenario
             if scenario.probe_type == "tool_calling":
                 scenario = scenario.model_copy(
-                    update={"probe_data": {**scenario.probe_data, "tools": runtime.assistant_tools}}
+                    update={"probe_data": {**scenario.probe_data, "tools": descriptor.assistant_tools}}
                 )
-            result = result.model_copy(update={"scenario": scenario, "assistant_tools": runtime.assistant_tools})
+            result = result.model_copy(
+                update={
+                    "scenario": scenario,
+                    "assistant_tools": descriptor.assistant_tools,
+                    "runtime_descriptor": descriptor,
+                }
+            )
         self.session_id_to_seed[session_id] = SeededUserSimEpisode(
             episode_id=body.episode_id,
             task_id=body.task_id,
@@ -631,19 +600,68 @@ class UserSimResourcesServer(SimpleResourcesServer):
         request: Request,
         tool_name: str,
         body: dict[str, Any] = Body(),
+        tool_call_id: str | None = Header(None, alias="X-NeMo-Gym-Tool-Call-Id"),
+        turn_idx: int | None = Header(None, alias="X-NeMo-Gym-Turn-Index"),
+        call_idx: int | None = Header(None, alias="X-NeMo-Gym-Call-Index"),
     ) -> Any:
         """Simulate one tool selected for the request's seeded episode."""
         seeded = self._seeded_episode(request)
         if seeded.runtime is None:
             raise HTTPException(status_code=404, detail="This episode does not expose probe tools")
+        if tool_call_id is None or turn_idx is None or call_idx is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Runtime tool calls require tool_call_id, turn_idx, and call_idx headers",
+            )
         try:
-            payload = await seeded.runtime.simulate_tool_call(tool_name, body)
+            payload = await seeded.runtime.simulate_tool_call(
+                tool_name,
+                body,
+                tool_call_id=tool_call_id,
+                turn_idx=turn_idx,
+                call_idx=call_idx,
+            )
         except ValueError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         try:
             return json.loads(payload)
         except json.JSONDecodeError:
             return {"result": payload}
+
+    async def synchronize_runtime_transcript(
+        self,
+        request: Request,
+        body: UserSimTranscriptSyncRequest,
+    ) -> UserSimRuntimeBooleanResponse:
+        """Synchronize the canonical transcript into the one owned runtime."""
+        seeded = self._seeded_episode(request)
+        if seeded.runtime is None:
+            raise HTTPException(status_code=404, detail="This episode has no external probe runtime")
+        await seeded.runtime.synchronize_transcript(body.messages)
+        return UserSimRuntimeBooleanResponse(value=True)
+
+    async def runtime_followup_instructions(
+        self,
+        request: Request,
+        body: UserSimRuntimeTurnRequest,
+    ) -> UserSimFollowupInstructionsResponse:
+        """Delegate probe-specific follow-up instructions to the owned runtime."""
+        seeded = self._seeded_episode(request)
+        if seeded.runtime is None:
+            raise HTTPException(status_code=404, detail="This episode has no external probe runtime")
+        return UserSimFollowupInstructionsResponse(
+            instructions=await seeded.runtime.format_followup_user_instructions(body.turn_idx)
+        )
+
+    async def runtime_capitulation(
+        self,
+        request: Request,
+    ) -> UserSimRuntimeBooleanResponse:
+        """Run the probe-specific stop hook over synchronized state."""
+        seeded = self._seeded_episode(request)
+        if seeded.runtime is None:
+            raise HTTPException(status_code=404, detail="This episode has no external probe runtime")
+        return UserSimRuntimeBooleanResponse(value=await seeded.runtime.is_capitulation_detected())
 
     async def verify(
         self,
@@ -664,11 +682,7 @@ class UserSimResourcesServer(SimpleResourcesServer):
             )
         native_result = verification_input.usersim_result
         if seeded.runtime is not None:
-            transcript = _external_probe_transcript(
-                verification_input.usersim_result.conversation_messages,
-                verification_input.invocations,
-            )
-            native_result = UserSimSimulationResult.model_validate(await seeded.runtime.finalize(transcript))
+            native_result = UserSimSimulationResult.model_validate(await seeded.runtime.finalize())
         native_scorer_name, native_scores, native_scorer_pass = await self._score_native_result(
             seeded,
             native_result,
@@ -679,9 +693,27 @@ class UserSimResourcesServer(SimpleResourcesServer):
         )
         participants_completed = {"user", "assistant"} <= _conversation_roles(native_result)
         scenario_completed = native_result.conversation_status and participants_completed and native_scorer_pass
+        simulation_failure = _simulation_infrastructure_failure(native_result)
+        scorer_failure = (
+            str(native_scores.get("error")) if native_scores is not None and native_scores.get("error") else None
+        )
+        evaluator_failure = (
+            str(assistant_eval.get("skipped_reason", "trajectory evaluator unavailable"))
+            if assistant_quality is None
+            else None
+        )
+        failure_reason = simulation_failure or scorer_failure or evaluator_failure
+        mask_sample = failure_reason is not None
         reward = assistant_quality if scenario_completed and assistant_quality is not None else 0.0
         return UserSimVerification(
             reward=reward,
+            mask_sample=mask_sample,
+            failure_kind=(
+                "judge_failed"
+                if scorer_failure is not None or evaluator_failure is not None
+                else ("usersim:simulation_failed" if simulation_failure is not None else None)
+            ),
+            failure_reason=failure_reason,
             reward_components={
                 "participants_completed": float(participants_completed),
                 "native_conversation_status": float(native_result.conversation_status),

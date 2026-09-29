@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -44,8 +45,10 @@ from nemo_gym.config_types import (
 )
 from nemo_gym.global_config import TOKEN_ID_CAPTURE_BLOCK, get_first_server_config_dict
 from nemo_gym.openai_utils import (
+    NeMoGymFunctionCallOutput,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseFunctionToolCall,
     NeMoGymResponseOutputMessage,
 )
 from nemo_gym.rollout_observability import AgentObservationBundle, ToolCallObservation, TrajectoryRecord
@@ -57,13 +60,15 @@ from nemo_gym.tool_access import (
     ToolAccess,
 )
 from resources_servers.usersim.episode_contracts import (
+    ProbeRuntimeDescriptor,
     UserSimEpisodeFailure,
     UserSimEpisodeRequest,
     UserSimEpisodeResponse,
     UserSimEpisodeResult,
+    UserSimFollowupInstructionsResponse,
     UserSimInvocation,
     UserSimProtocolConfig,
-    UserSimScenario,
+    UserSimRuntimeBooleanResponse,
     UserSimSeedResponse,
     UserSimSimulationResult,
     UserSimTaskInput,
@@ -279,7 +284,7 @@ class _ConversationBridge:
             message=SimpleNamespace(
                 content=_response_text(gym_response),
                 reasoning_content=None,
-                tool_calls=None,
+                tool_calls=_response_tool_calls(gym_response),
             ),
             usage=(
                 SimpleNamespace(input_tokens=usage.input_tokens, output_tokens=usage.output_tokens)
@@ -364,6 +369,11 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
                     task_id=request.task.task_id,
                     tool_accesses=tool_accesses if alias == "assistant_model" else [],
                     sandbox_access=seed.sandbox_access if alias in {"user_model", "assistant_model"} else None,
+                    tool_loop_policy=(
+                        seed.runtime_descriptor.loop_policy
+                        if alias == "assistant_model" and seed.runtime_descriptor is not None
+                        else None
+                    ),
                 )
                 session_http_response = await self.server_client.post(
                     server_name=target.name,
@@ -414,7 +424,7 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
             seed.assistant_tools,
         )
         try:
-            raw_result = await self._run_usersim(bridge, seed.scenario)
+            raw_result = await self._run_usersim(bridge, seed)
             result = UserSimSimulationResult.model_validate(raw_result)
             _finalize_termination(bridge.invocations, result)
             if not any(invocation.role == "assistant" for invocation in bridge.invocations):
@@ -473,7 +483,10 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
             ),
         )
 
-    async def _run_usersim(self, bridge: _ConversationBridge, scenario: UserSimScenario) -> dict[str, Any]:
+    async def _run_usersim(self, bridge: _ConversationBridge, seed: UserSimSeedResponse) -> dict[str, Any]:
+        if seed.runtime_descriptor is not None:
+            return await self._run_external_probe(bridge, seed.runtime_descriptor)
+
         from usersim.engine.config import ConversationSimulatorConfig
         from usersim.engine.core.llm import set_debug_log_path
         from usersim.engine.generator import ConversationSimulatorGenerator
@@ -481,7 +494,12 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
         set_debug_log_path(None)
         config_values = self.config.protocol_config.model_dump(mode="python", exclude_none=True)
         config_values.update(
-            {"name": "conversation_messages", "locale": scenario.locale, "max_turns": self.config.max_turns}
+            {
+                "name": "conversation_messages",
+                "locale": seed.scenario.locale,
+                "max_turns": self.config.max_turns,
+                "random_seed": seed.usersim_context.seed,
+            }
         )
         config = ConversationSimulatorConfig.model_validate(config_values)
         models: dict[str, Any] = {alias: _GymModelFacade(alias, bridge) for alias in _USERSIM_MODEL_ALIASES}
@@ -489,9 +507,123 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
         # probe tool runtimes, which execute in the Resources Server.
         models["api_response_model"] = _ResourcesOwnedModelFacade()
         generator = _create_usersim_generator(ConversationSimulatorGenerator, config, models)
-        data = scenario.model_dump(mode="python", exclude={"locale", "probe_data"})
-        data.update(scenario.probe_data)
+        data = seed.scenario.model_dump(mode="python", exclude={"locale", "probe_data"})
+        data.update(seed.scenario.probe_data)
         return await generator.agenerate(data)
+
+    async def _run_external_probe(
+        self,
+        bridge: _ConversationBridge,
+        descriptor: ProbeRuntimeDescriptor,
+    ) -> dict[str, Any]:
+        """Drive descriptor-defined participant activations without constructing a probe.
+
+        UserSim does not yet expose a remote ``ConversationLoop`` proxy. This
+        fallback therefore owns only the generic outer activation order; all
+        probe-specific state and hooks remain delegated to the Resources-owned
+        runtime, and the descriptor supplies every assistant-loop decision.
+        """
+        transcript: list[dict[str, Any]] = []
+        if descriptor.assistant_system_prompt:
+            transcript.append({"role": "system", "content": descriptor.assistant_system_prompt})
+
+        opening = descriptor.initial_user_message
+        if opening is None:
+            prompt = descriptor.turn0_user_query_instruction or (
+                "Write exactly one short user message that starts this conversation. Plain text only."
+            )
+            user_messages = []
+            if descriptor.user_system_prompt:
+                user_messages.append({"role": "system", "content": descriptor.user_system_prompt})
+            user_messages.append({"role": "user", "content": prompt})
+            generated = await bridge.invoke("user_model", user_messages, max_tokens=None, tools=None)
+            opening = generated.message.content
+        if not opening:
+            raise ValueError("UserSim runtime produced no opening user message")
+        transcript.append({"role": "user", "content": opening})
+        await self._synchronize_runtime(bridge, transcript)
+
+        for turn_idx in range(self.config.max_turns):
+            await bridge.invoke(
+                "assistant_model",
+                transcript,
+                max_tokens=None,
+                tools=descriptor.assistant_tools,
+            )
+            transcript.extend(_response_output_messages(bridge.invocations[-1].response))
+            await self._synchronize_runtime(bridge, transcript)
+
+            if descriptor.loop_policy.single_user_turn or turn_idx >= self.config.max_turns - 1:
+                break
+            if await self._runtime_capitulated(bridge):
+                break
+
+            instructions = await self._runtime_followup_instructions(bridge, turn_idx + 1)
+            public_history = "\n".join(
+                f"{message['role'].upper()}: {message.get('content', '')}"
+                for message in transcript
+                if message.get("role") in {"user", "assistant"} and message.get("content")
+            )
+            followup_prompt = (
+                "Conversation so far:\n"
+                f"{public_history}\n\n"
+                "Write exactly one short USER follow-up message. Stay in character and output plain text only."
+            )
+            if instructions:
+                followup_prompt += "\n\nAdditional instructions:\n" + "\n".join(instructions)
+            user_messages = []
+            if descriptor.user_system_prompt:
+                user_messages.append({"role": "system", "content": descriptor.user_system_prompt})
+            user_messages.append({"role": "user", "content": followup_prompt})
+            generated = await bridge.invoke("user_model", user_messages, max_tokens=None, tools=None)
+            if not generated.message.content:
+                raise ValueError("UserSim user participant produced an empty follow-up")
+            transcript.append({"role": "user", "content": generated.message.content})
+            await self._synchronize_runtime(bridge, transcript)
+
+        return {
+            "conversation_messages": transcript,
+            "conversation_status": True,
+            "simulation_outcome": {"status": "pending_runtime_finalization"},
+        }
+
+    async def _synchronize_runtime(
+        self,
+        bridge: _ConversationBridge,
+        transcript: list[dict[str, Any]],
+    ) -> None:
+        response = await self.server_client.post(
+            server_name=self.config.resources_server.name,
+            url_path="/runtime/transcript",
+            json={"messages": transcript},
+            cookies=bridge.resources_cookies,
+        )
+        await raise_for_status(response)
+        UserSimRuntimeBooleanResponse.model_validate(await get_response_json(response))
+
+    async def _runtime_followup_instructions(
+        self,
+        bridge: _ConversationBridge,
+        turn_idx: int,
+    ) -> list[str]:
+        response = await self.server_client.post(
+            server_name=self.config.resources_server.name,
+            url_path="/runtime/followup_instructions",
+            json={"turn_idx": turn_idx},
+            cookies=bridge.resources_cookies,
+        )
+        await raise_for_status(response)
+        return UserSimFollowupInstructionsResponse.model_validate(await get_response_json(response)).instructions
+
+    async def _runtime_capitulated(self, bridge: _ConversationBridge) -> bool:
+        response = await self.server_client.post(
+            server_name=self.config.resources_server.name,
+            url_path="/runtime/capitulation",
+            json={},
+            cookies=bridge.resources_cookies,
+        )
+        await raise_for_status(response)
+        return UserSimRuntimeBooleanResponse.model_validate(await get_response_json(response)).value
 
     def responses_path(self, target_name: str, request: UserSimEpisodeRequest) -> str:
         block = self.server_client.global_config_dict.get(TOKEN_ID_CAPTURE_BLOCK) or {}
@@ -596,7 +728,7 @@ def _to_responses_tool(tool: Any) -> dict[str, Any]:
         "name": function["name"],
         "description": function.get("description"),
         "parameters": function.get("parameters", {}),
-        "strict": function.get("strict"),
+        "strict": function.get("strict", False),
     }
 
 
@@ -610,6 +742,58 @@ def _response_text(response: NeMoGymResponse) -> str:
             if text:
                 chunks.append(text)
     return "\n".join(chunks)
+
+
+def _response_tool_calls(response: NeMoGymResponse) -> list[SimpleNamespace] | None:
+    calls = [
+        SimpleNamespace(id=item.call_id, name=item.name, arguments_json=item.arguments)
+        for item in response.output
+        if isinstance(item, NeMoGymResponseFunctionToolCall)
+    ]
+    return calls or None
+
+
+def _response_output_messages(response: NeMoGymResponse) -> list[dict[str, Any]]:
+    """Convert one complete Agent activation to canonical chat messages."""
+    messages: list[dict[str, Any]] = []
+    pending_calls: list[dict[str, Any]] = []
+
+    def flush_calls() -> None:
+        if pending_calls:
+            messages.append({"role": "assistant", "content": "", "tool_calls": list(pending_calls)})
+            pending_calls.clear()
+
+    for item in response.output:
+        if isinstance(item, NeMoGymResponseFunctionToolCall):
+            pending_calls.append(
+                {
+                    "id": item.call_id,
+                    "type": "function",
+                    "function": {"name": item.name, "arguments": item.arguments},
+                }
+            )
+            continue
+        flush_calls()
+        if isinstance(item, NeMoGymFunctionCallOutput):
+            messages.append(
+                {
+                    "role": "tool",
+                    "content": item.output if isinstance(item.output, str) else json.dumps(item.output),
+                    "tool_call_id": item.call_id,
+                }
+            )
+        elif isinstance(item, NeMoGymResponseOutputMessage):
+            messages.append({"role": "assistant", "content": _response_message_text(item)})
+    flush_calls()
+    return messages
+
+
+def _response_message_text(message: NeMoGymResponseOutputMessage) -> str:
+    return "\n".join(
+        text
+        for content in message.content
+        if (text := getattr(content, "text", None) or getattr(content, "refusal", None))
+    )
 
 
 def _finalize_termination(invocations: list[UserSimInvocation], result: UserSimSimulationResult) -> None:

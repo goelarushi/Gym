@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 from typing import Any
 
 import orjson
+import pytest
 from omegaconf import OmegaConf
 from pydantic import ConfigDict
 
@@ -17,8 +19,14 @@ from environment_servers.usersim.app import (
 from nemo_gym.base_environment_server import BaseEnvironmentServer
 from nemo_gym.config_types import AgentServerRef, ModelServerRef, ResourcesServerRef
 from nemo_gym.episode_types import EpisodeId, MaterializedTask, TaskId
+from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.server_utils import BaseServerConfig, ServerClient
-from resources_servers.usersim.episode_contracts import UserSimEpisodeRequest, UserSimTaskInput
+from resources_servers.usersim.episode_contracts import (
+    ProbeRuntimeDescriptor,
+    UserSimEpisodeRequest,
+    UserSimSeedResponse,
+    UserSimTaskInput,
+)
 
 
 class _Cookie:
@@ -84,6 +92,70 @@ def _model_response(response_id: str, text: str) -> dict[str, Any]:
         "tool_choice": "auto",
         "tools": [],
     }
+
+
+def _tool_model_response() -> dict[str, Any]:
+    response = _model_response("assistant-response", "Done.")
+    response["output"] = [
+        {
+            "id": "fc-1",
+            "call_id": "call-1",
+            "name": "safe_action",
+            "arguments": '{"value":"x"}',
+            "type": "function_call",
+            "status": "completed",
+        },
+        {
+            "call_id": "call-1",
+            "output": '{"ok":true}',
+            "type": "function_call_output",
+        },
+        *response["output"],
+    ]
+    return response
+
+
+def _runtime_descriptor() -> ProbeRuntimeDescriptor:
+    return ProbeRuntimeDescriptor.model_validate(
+        {
+            "probe_type": "safety_agentic",
+            "assistant_tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "safe_action",
+                        "description": "Perform an action.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            "allowed_tool_names": ["safe_action"],
+            "initial_user_message": "Perform the action.",
+            "loop_policy": {
+                "tool_round_mode": "multi",
+                "max_assistant_activations": 3,
+                "final_synthesis_without_tools": False,
+                "single_user_turn": True,
+                "assistant_error_behavior": "fail_episode",
+                "tool_error_behavior": "return_error_payload",
+                "max_tool_response_attempts": 1,
+                "assistant_resampling": False,
+            },
+            "user_system_prompt": "",
+            "assistant_system_prompt": "",
+            "turn0_user_query_instruction": None,
+            "user_interaction_style": "direct",
+            "patience": 0.5,
+            "user_turn_policy": {
+                "context_compression": True,
+                "wrap_up": True,
+                "followup_anchor": None,
+                "allowed_phrases": [],
+                "script_check_ignores": [],
+                "check_opening": "none",
+            },
+        }
+    )
 
 
 def _environment_server(*, token_capture: bool = False) -> tuple[UserSimEnvironmentServer, _Client]:
@@ -265,6 +337,62 @@ def test_usersim_generator_uses_instance_api() -> None:
         "model": models["user_model"],
         "data": {"probe_type": "general_open_ended"},
     }
+
+
+async def test_tool_probe_uses_remote_driver_and_preserves_tool_transcript(monkeypatch) -> None:
+    environment_server, _ = _environment_server()
+    synchronized = []
+
+    async def synchronize(_bridge, transcript):
+        synchronized.append([dict(message) for message in transcript])
+
+    monkeypatch.setattr(environment_server, "_synchronize_runtime", synchronize)
+    monkeypatch.setattr(
+        "environment_servers.usersim.app._create_usersim_generator",
+        lambda *_args, **_kwargs: pytest.fail("tool probes must not construct a local UserSim generator"),
+    )
+
+    response = NeMoGymResponse.model_validate(_tool_model_response())
+
+    class Bridge:
+        resources_cookies = {"session": "resources"}
+        invocations = []
+
+        async def invoke(self, alias, messages, *, max_tokens, tools):
+            assert alias == "assistant_model"
+            assert tools and tools[0]["function"]["name"] == "safe_action"
+            self.invocations.append(SimpleNamespace(response=response))
+            return SimpleNamespace(message=SimpleNamespace(content="Done."))
+
+    seed = UserSimSeedResponse.model_validate(
+        {
+            "resources_session_id": "resources-session",
+            "scenario": {
+                "persona": {"first_name": "Morgan"},
+                "probe_type": "safety_agentic",
+                "theme": "safety",
+            },
+            "usersim_context": {
+                "locale": "en_US",
+                "seed": 42,
+                "personas_dataset_version": "0.0.2",
+                "personas_panel_sha256": "a" * 64,
+                "usersim_revision": "b" * 40,
+            },
+            "runtime_descriptor": _runtime_descriptor().model_dump(mode="json"),
+        }
+    )
+    result = await environment_server._run_usersim(Bridge(), seed)
+
+    assert [message["role"] for message in result["conversation_messages"]] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert result["conversation_messages"][1]["tool_calls"][0]["id"] == "call-1"
+    assert result["conversation_messages"][2]["tool_call_id"] == "call-1"
+    assert synchronized[-1] == result["conversation_messages"]
 
 
 async def test_usersim_environment_server_runs_native_episode(monkeypatch) -> None:

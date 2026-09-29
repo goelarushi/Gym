@@ -21,6 +21,7 @@ from fastapi import Response
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
+from nemo_gym.base_responses_api_agent import AgentToolLoopPolicy
 from nemo_gym.global_config import (
     AGENT_REF_KEY_NAME,
     ATTEMPT_INDEX_KEY_NAME,
@@ -449,6 +450,108 @@ class TestApp:
         [tool] = trajectory.tool_calls
         assert (tool.output, tool.status, tool.error_type) == ("bad input", "failed", "http_422")
         assert tool.started_at is not None and tool.completed_at is not None and tool.duration_ms is not None
+
+    async def test_session_policy_enforces_final_synthesis_and_tool_identity(self) -> None:
+        server, server_client = _make_agent(True)
+        response_base = {
+            "created_at": 1.0,
+            "model": "model",
+            "object": "response",
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+        }
+        model_payloads = iter(
+            [
+                response_base
+                | {
+                    "id": "tool-response",
+                    "output": [
+                        {
+                            "id": "fc-1",
+                            "call_id": "call-7",
+                            "name": "lookup",
+                            "arguments": '{"query":"x"}',
+                            "type": "function_call",
+                            "status": "completed",
+                        },
+                        {
+                            "id": "fc-2",
+                            "call_id": "call-8",
+                            "name": "lookup",
+                            "arguments": '{"query":"ignored"}',
+                            "type": "function_call",
+                            "status": "completed",
+                        },
+                    ],
+                },
+                response_base
+                | {
+                    "id": "final-response",
+                    "output": [
+                        {
+                            "id": "message-1",
+                            "content": [{"annotations": [], "text": "final", "type": "output_text"}],
+                            "role": "assistant",
+                            "status": "completed",
+                            "type": "message",
+                        }
+                    ],
+                },
+            ]
+        )
+
+        async def post(*, server_name, url_path, **kwargs):
+            if server_name == "model":
+                return _mock_response(next(model_payloads))
+            assert (server_name, url_path) == ("resources", "/lookup")
+            return _mock_response(content='{"value":"ok"}')
+
+        server_client.post = AsyncMock(side_effect=post)
+        response, _, _, _ = await server._create_episode(
+            NeMoGymResponseCreateParamsNonStreaming(
+                input="question",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "description": "Look up a value.",
+                        "parameters": {"type": "object", "properties": {}},
+                        "strict": False,
+                    }
+                ],
+            ),
+            model_url_path="/v1/responses",
+            resources_server_cookies={},
+            collect_trajectory=True,
+            invocation_id="activation-4",
+            activation_idx=4,
+            tool_loop_policy=AgentToolLoopPolicy(
+                tool_round_mode="single",
+                max_assistant_activations=2,
+                final_synthesis_without_tools=True,
+                single_user_turn=False,
+                assistant_error_behavior="fail_episode",
+                tool_error_behavior="return_error_payload",
+                max_tool_calls_per_turn=1,
+                max_tool_response_attempts=1,
+                assistant_resampling=False,
+            ),
+        )
+
+        assert [item.type for item in response.output] == [
+            "function_call",
+            "function_call_output",
+            "message",
+        ]
+        tool_call = server_client.post.await_args_list[1]
+        assert tool_call.kwargs["headers"] == {
+            "X-NeMo-Gym-Tool-Call-Id": "call-7",
+            "X-NeMo-Gym-Turn-Index": "4",
+            "X-NeMo-Gym-Call-Index": "0",
+        }
+        final_request = server_client.post.await_args_list[2].kwargs["json"]
+        assert final_request.tools == []
 
     @pytest.mark.parametrize(("capture_enabled", "override_responses"), ((False, False), (True, False), (True, True)))
     async def test_run_preserves_self_dispatch(self, capture_enabled: bool, override_responses: bool) -> None:

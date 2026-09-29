@@ -34,6 +34,7 @@ from nemo_gym.base_responses_api_agent import (
     AgentCloseSessionResponse,
     AgentSeedSessionRequest,
     AgentSeedSessionResponse,
+    AgentToolLoopPolicy,
     BaseResponsesAPIAgentConfig,
     Body,
     SimpleResponsesAPIAgent,
@@ -65,6 +66,9 @@ from nemo_gym.tool_access import DirectHTTPToolAccess
 LOG = logging.getLogger(__name__)
 
 _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
+TOOL_CALL_ID_HEADER = "X-NeMo-Gym-Tool-Call-Id"
+TOOL_TURN_INDEX_HEADER = "X-NeMo-Gym-Turn-Index"
+TOOL_CALL_INDEX_HEADER = "X-NeMo-Gym-Call-Index"
 
 
 class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
@@ -91,6 +95,7 @@ class _SimpleAgentSession:
     episode_id: Any
     task_id: Any
     resources_cookies: dict[str, str]
+    tool_loop_policy: AgentToolLoopPolicy | None = None
     trajectories: list[TrajectoryRecord] = field(default_factory=list)
 
 
@@ -119,6 +124,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             episode_id=body.episode_id,
             task_id=body.task_id,
             resources_cookies=resources_cookies,
+            tool_loop_policy=body.tool_loop_policy,
         )
         return AgentSeedSessionResponse(agent_session_id=body.agent_session_id)
 
@@ -163,6 +169,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         rollout_id: str = "unscoped",
         collect_trajectory: bool = False,
         invocation_id: str = "root",
+        activation_idx: int = 0,
+        tool_loop_policy: AgentToolLoopPolicy | None = None,
     ) -> tuple[NeMoGymResponse, TrajectoryRecord | None, Any, Any]:
         tool_records: list[TrajectoryToolCall] = []
         model_calls: list[ModelCallRef] = []
@@ -178,10 +186,19 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         step = 0
         invocation_status = "completed"
         model_server_cookies = None
+        executed_call_count = 0
+        force_synthesis = False
 
         while True:
             step += 1
             new_body = body.model_copy(update={"input": body.input + new_outputs})
+            final_synthesis_step = (
+                tool_loop_policy is not None
+                and tool_loop_policy.final_synthesis_without_tools
+                and (force_synthesis or step == tool_loop_policy.max_assistant_activations)
+            )
+            if final_synthesis_step:
+                new_body = new_body.model_copy(update={"tools": [], "tool_choice": "auto"})
             if collect_trajectory:
                 turn_timestamp = time()
 
@@ -203,6 +220,20 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 ) from e
 
             output = model_response.output
+            tool_call_cap_reached = False
+            if tool_loop_policy is not None and tool_loop_policy.max_tool_calls_per_turn is not None:
+                remaining_calls = max(tool_loop_policy.max_tool_calls_per_turn - executed_call_count, 0)
+                filtered_output = []
+                for item in output:
+                    if item.type != "function_call":
+                        filtered_output.append(item)
+                    elif remaining_calls > 0:
+                        filtered_output.append(item)
+                        remaining_calls -= 1
+                    else:
+                        tool_call_cap_reached = True
+                output = filtered_output
+                model_response.output = output
             new_outputs.extend(output)
             if collect_trajectory:
                 turn_model_calls = []
@@ -244,6 +275,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             all_output_messages: List[NeMoGymResponseOutputMessage] = [
                 o for o in output if o.type == "message" and o.role == "assistant"
             ]
+            if final_synthesis_step and all_fn_calls:
+                invocation_status = "incomplete"
+                break
             if not all_fn_calls:
                 if not all_output_messages:
                     invocation_status = "incomplete"
@@ -273,6 +307,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 break
 
             for output_function_call in all_fn_calls:
+                call_idx = executed_call_count
+                executed_call_count += 1
                 if collect_trajectory:
                     started_at = time()
                     started_monotonic = perf_counter()
@@ -290,6 +326,11 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         url_path=f"/{output_function_call.name}",
                         json=parsed_arguments,
                         cookies=resources_server_cookies,
+                        headers={
+                            TOOL_CALL_ID_HEADER: output_function_call.call_id,
+                            TOOL_TURN_INDEX_HEADER: str(activation_idx),
+                            TOOL_CALL_INDEX_HEADER: str(call_idx),
+                        },
                     )
                     tool_output = (await api_response.content.read()).decode()
                     resources_server_cookies = api_response.cookies
@@ -324,6 +365,19 @@ class SimpleAgent(SimpleResponsesAPIAgent):
 
             if collect_trajectory and all_fn_calls:
                 turns[-1].step_count = len(tool_records)
+
+            if (
+                tool_loop_policy is not None
+                and tool_loop_policy.max_tool_calls_per_turn is not None
+                and executed_call_count >= tool_loop_policy.max_tool_calls_per_turn
+            ):
+                tool_call_cap_reached = True
+            if tool_call_cap_reached and tool_loop_policy is not None:
+                force_synthesis = tool_loop_policy.final_synthesis_without_tools
+
+            if tool_loop_policy is not None and step >= tool_loop_policy.max_assistant_activations:
+                invocation_status = "incomplete"
+                break
 
             # Check if max steps is not None and if we have exhausted it.
             if self.config.max_steps and step >= self.config.max_steps:
@@ -371,6 +425,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             rollout_id=rollout_id or "unscoped",
             collect_trajectory=collect_trajectory,
             invocation_id=f"activation-{len(session.trajectories)}" if session is not None else "root",
+            activation_idx=len(session.trajectories) if session is not None else 0,
+            tool_loop_policy=session.tool_loop_policy if session is not None else None,
         )
         if session is not None:
             session.resources_cookies = dict(resources_server_cookies)

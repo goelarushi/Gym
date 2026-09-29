@@ -4,7 +4,8 @@
 import hashlib
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -245,6 +246,8 @@ def test_probe_tools_are_scoped_to_seeded_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    runtimes = []
+
     class Runtime:
         assistant_tools = [
             {
@@ -257,10 +260,64 @@ def test_probe_tools_are_scoped_to_seeded_session(
             }
         ]
 
-        async def simulate_tool_call(self, name, body):
+        def __init__(self) -> None:
+            self.finalize_calls = 0
+            self.transcripts = []
+            runtimes.append(self)
+
+        async def descriptor(self):
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "probe_type": "safety_agentic",
+                    "assistant_tools": self.assistant_tools,
+                    "allowed_tool_names": ["safe_action"],
+                    "initial_user_message": "Perform the safe action.",
+                    "loop_policy": {
+                        "tool_round_mode": "multi",
+                        "max_assistant_activations": 3,
+                        "final_synthesis_without_tools": False,
+                        "single_user_turn": True,
+                        "assistant_error_behavior": "fail_episode",
+                        "tool_error_behavior": "return_error_payload",
+                        "max_tool_response_attempts": 1,
+                        "assistant_resampling": False,
+                    },
+                    "user_system_prompt": "",
+                    "assistant_system_prompt": "",
+                    "turn0_user_query_instruction": None,
+                    "user_interaction_style": "direct",
+                    "patience": 0.5,
+                    "user_turn_policy": {
+                        "context_compression": True,
+                        "wrap_up": True,
+                        "followup_anchor": None,
+                        "allowed_phrases": [],
+                        "script_check_ignores": [],
+                        "check_opening": "none",
+                    },
+                }
+            )
+
+        async def simulate_tool_call(self, name, body, *, tool_call_id, turn_idx, call_idx):
             if name != "safe_action":
                 raise ValueError(f"Tool {name!r} is not available")
-            return json.dumps({"session_seed": body["seed"]})
+            return json.dumps(
+                {
+                    "session_seed": body["seed"],
+                    "tool_call_id": tool_call_id,
+                    "turn_idx": turn_idx,
+                    "call_idx": call_idx,
+                }
+            )
+
+        async def synchronize_transcript(self, messages):
+            self.transcripts.append(messages)
+
+        async def format_followup_user_instructions(self, _turn_idx):
+            return []
+
+        async def is_capitulation_detected(self):
+            return False
 
     monkeypatch.setattr(
         UserSimResourcesServer,
@@ -278,15 +335,120 @@ def test_probe_tools_are_scoped_to_seeded_session(
             "/seed_session",
             json=_seed_body(seed=2, probe_type="safety_agentic"),
         )
-        first_result = first.post("/safe_action", json={"seed": 1})
-        second_result = second.post("/safe_action", json={"seed": 2})
-        rejected = first.post("/other_action", json={})
+        first_result = first.post(
+            "/safe_action",
+            json={"seed": 1},
+            headers={
+                "X-NeMo-Gym-Tool-Call-Id": "call-1",
+                "X-NeMo-Gym-Turn-Index": "0",
+                "X-NeMo-Gym-Call-Index": "0",
+            },
+        )
+        second_result = second.post(
+            "/safe_action",
+            json={"seed": 2},
+            headers={
+                "X-NeMo-Gym-Tool-Call-Id": "call-2",
+                "X-NeMo-Gym-Turn-Index": "1",
+                "X-NeMo-Gym-Call-Index": "3",
+            },
+        )
+        rejected = first.post(
+            "/other_action",
+            json={},
+            headers={
+                "X-NeMo-Gym-Tool-Call-Id": "call-3",
+                "X-NeMo-Gym-Turn-Index": "0",
+                "X-NeMo-Gym-Call-Index": "1",
+            },
+        )
+        missing_identity = first.post("/safe_action", json={"seed": 1})
 
+    assert len(runtimes) == 2
     assert first_seed.json()["assistant_tools"][0]["function"]["name"] == "safe_action"
+    assert first_seed.json()["runtime_descriptor"]["loop_policy"]["max_assistant_activations"] == 3
     assert second_seed.status_code == 200
-    assert first_result.json() == {"session_seed": 1}
-    assert second_result.json() == {"session_seed": 2}
+    assert first_result.json() == {
+        "session_seed": 1,
+        "tool_call_id": "call-1",
+        "turn_idx": 0,
+        "call_idx": 0,
+    }
+    assert second_result.json() == {
+        "session_seed": 2,
+        "tool_call_id": "call-2",
+        "turn_idx": 1,
+        "call_idx": 3,
+    }
     assert rejected.status_code == 404
+    assert missing_identity.status_code == 422
+
+
+def test_verify_finalizes_owned_runtime_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = MagicMock()
+    runtime.descriptor = AsyncMock(
+        return_value=SimpleNamespace(
+            to_dict=lambda: {
+                "probe_type": "safety_agentic",
+                "assistant_tools": [],
+                "allowed_tool_names": [],
+                "initial_user_message": "Do the task.",
+                "loop_policy": {
+                    "tool_round_mode": "multi",
+                    "max_assistant_activations": 2,
+                    "final_synthesis_without_tools": False,
+                    "single_user_turn": True,
+                    "assistant_error_behavior": "fail_episode",
+                    "tool_error_behavior": "return_error_payload",
+                    "max_tool_response_attempts": 1,
+                    "assistant_resampling": False,
+                },
+                "user_system_prompt": "",
+                "assistant_system_prompt": "",
+                "turn0_user_query_instruction": None,
+                "user_interaction_style": "direct",
+                "patience": 0.5,
+                "user_turn_policy": {
+                    "context_compression": True,
+                    "wrap_up": True,
+                    "followup_anchor": None,
+                    "allowed_phrases": [],
+                    "script_check_ignores": [],
+                    "check_opening": "none",
+                },
+            }
+        )
+    )
+    runtime.finalize = AsyncMock(
+        return_value={
+            "conversation_messages": [
+                {"role": "user", "content": "Do the task."},
+                {"role": "assistant", "content": "Done."},
+            ],
+            "conversation_status": True,
+            "simulation_outcome": {"status": "ok"},
+        }
+    )
+    runtime.evidence = AsyncMock(return_value={"result_extras": {}})
+    monkeypatch.setattr(UserSimResourcesServer, "_create_probe_runtime", lambda *_args, **_kwargs: runtime)
+
+    async def score(*_args, **_kwargs):
+        return "safety_agentic", {"status_proposal": True}, True
+
+    monkeypatch.setattr(UserSimResourcesServer, "_score_native_result", score)
+    _write_personas(tmp_path)
+    with TestClient(_app(tmp_path)) as client:
+        seed = client.post(
+            "/seed_session",
+            json=_seed_body(seed=42, probe_type="safety_agentic"),
+        ).json()
+        verified = client.post("/verify", json=_verify_body(seed))
+
+    assert verified.status_code == 200
+    runtime.finalize.assert_awaited_once_with()
 
 
 def test_native_safety_probe_exposes_and_simulates_selected_tools(tmp_path: Path) -> None:
@@ -298,11 +460,40 @@ def test_native_safety_probe_exposes_and_simulates_selected_tools(tmp_path: Path
             json=_seed_body(seed=42, probe_type="safety_agentic"),
         )
         tool_name = seed.json()["assistant_tools"][0]["function"]["name"]
-        result = client.post(f"/{tool_name}", json={})
-        verified = client.post("/verify", json=_verify_body(seed.json()))
+        assistant_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+        }
+        result = client.post(
+            f"/{tool_name}",
+            json={},
+            headers={
+                "X-NeMo-Gym-Tool-Call-Id": "call-1",
+                "X-NeMo-Gym-Turn-Index": "0",
+                "X-NeMo-Gym-Call-Index": "0",
+            },
+        )
+        transcript = [
+            {"role": "user", "content": seed.json()["runtime_descriptor"]["initial_user_message"]},
+            assistant_call,
+            {"role": "tool", "content": json.dumps(result.json()), "tool_call_id": "call-1"},
+            {"role": "assistant", "content": "Done."},
+        ]
+        synchronized = client.post("/runtime/transcript", json={"messages": transcript})
+        verify_body = _verify_body(seed.json())
+        verify_body["verification_input"]["usersim_result"]["conversation_messages"] = transcript
+        verified = client.post("/verify", json=verify_body)
 
     assert seed.status_code == 200
     assert result.status_code == 200
+    assert synchronized.status_code == 200
     assert isinstance(result.json(), dict)
     assert verified.status_code == 200
     assert verified.json()["native_usersim_result"]["num_tool_calls"] == 1
@@ -428,6 +619,7 @@ def test_verify_applies_native_scorer_to_non_tool_probe(
     assert verified["reward_components"]["native_scorer_applied"] == 1.0
     assert verified["verifier_data"]["native_scorer_name"] == "safety_chat_pressure"
     assert verified["verifier_data"]["native_scores"]["error"] == error
+    assert verified["mask_sample"] is (error is not None)
 
 
 def test_verify_skips_concealment_scorer_for_default_health_variant(
@@ -479,6 +671,8 @@ def test_verify_translates_native_scorer_exception_to_failed_evidence(
         "status_proposal": False,
         "error": "RuntimeError: scorer unavailable",
     }
+    assert verified["mask_sample"] is True
+    assert verified["failure_kind"] == "judge_failed"
 
 
 def test_verify_rejects_context_from_another_seeded_episode(tmp_path: Path) -> None:
