@@ -119,7 +119,6 @@ capture_dir="$(pwd)/results/usersim/model-calls"
 
 gym eval run \
   --environment usersim \
-  --agent usersim_assistant \
   --split benchmark \
   --output results/usersim/rollouts.jsonl \
   --limit 1 \
@@ -231,7 +230,6 @@ After inspecting the smoke rollout, remove `--limit 1` to run the 13 prepared ex
 ```bash
 gym eval run \
   --environment usersim \
-  --agent usersim_assistant \
   --split benchmark \
   --output results/usersim/all-probes.jsonl \
   --num-repeats 1 \
