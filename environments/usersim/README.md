@@ -31,16 +31,20 @@ probe-selected tool schemas to the Assistant Agent. The Agent owns model/tool
 iteration and invokes standard Resources Server `POST /{tool_name}` endpoints.
 Ordered parallel calls use `POST /runtime/tool_calls`; UserSim assigns semantic
 turn/call indices. Single tool responses remain opaque text.
-The Resources Server owns the episode-scoped tool implementation, mutable
-state, and native verification evidence. All other probes execute their native
-UserSim conversation shape without Assistant tools.
+The Resources Server owns the episode-scoped runtime, loop policy, tool
+implementation, mutable state, completion, and native verification evidence.
+The Environment Server drives participant activations from that runtime
+descriptor and does not resolve a second probe. All other probes execute their
+one native UserSim conversation
+shape without Assistant tools.
 For `identity_disclosure`, the integration gives UserSim the Assistant's
 configured upstream model ID so the native probe can resolve and score the
 expected developer identity.
 
 The resulting ordered `result.invocations` retain User and Assistant Agent
-activations, Judge and Summary support-model calls, tool calls and results,
-post-activation state, and observations.
+activations, any Environment-owned Judge and Summary support-model calls,
+tool calls and results, post-activation state, and observations. Probe tool
+simulation and verification support calls remain Resources-owned evidence.
 
 The User and Assistant Agents share `policy_model`. The Environment Server
 routes UserSim's Judge and Summary calls directly to `support_model`, without

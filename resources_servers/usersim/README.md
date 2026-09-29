@@ -88,14 +88,17 @@ At `/seed_session`, the server:
 1. Validates the row's revision, panel version/checksum, locale, persona, and probe.
 2. Stores the resolved context in task-scoped session state.
 3. Uses the row's prepared persona, probe, theme, goal, and probe data unchanged.
-4. Returns a `UserSimScenario` to the Environment Server before its first participant
+4. For a tool probe, constructs exactly one `ProbeEpisodeRuntime` and returns its
+   serializable descriptor: tool schemas, participant prompts, and tool-loop policy.
+5. Returns the resolved scenario to the Environment Server before its first participant
    invocation.
 
-The Environment Server gives the scenario to NeMo UserSim's conversation
-generator, routes User and Assistant calls through Agent Servers, routes Judge
-and Summary calls directly to the support Model Server, and submits the
-completed episode to `/verify`. It then closes the Resources session on every
-outcome.
+For probes without tools, the Environment Server gives the scenario to NeMo
+UserSim's native conversation generator. For tool probes, it drives participant
+activations from the Resources-owned runtime descriptor and never constructs a
+second probe. It submits each canonical transcript update to that runtime,
+then submits the completed episode to `/verify` and closes the Resources
+session on every outcome.
 
 `UserSimEnvironmentServer` directly owns this protocol; there is no generic
 multi-agent engine. Its native `UserSimEpisodeResponse` contains exactly one
@@ -112,11 +115,19 @@ retained with probe runtime evidence rather than added to this invocation list.
 ## Probe tools and episode state
 
 NeMo UserSim selects any Assistant tool schemas required by the resolved probe.
-The Environment Server passes those schemas only to the Assistant Agent, which
-owns the model/tool iteration. Each selected tool is exposed through the
-standard Resources Server `POST /{tool_name}` route. The shared Resources
-session cookie selects that episode's allowlist, simulated state, and verifier
-evidence, so another episode cannot call or mutate those tools.
+Its runtime also publishes a declarative loop policy, including single- versus
+multi-round execution, activation and call limits, and whether a tools-disabled
+synthesis pass is required. The Environment Server passes the schemas and
+policy only to the Assistant Agent. The Agent owns model-to-tool-to-model
+iteration without embedding probe names or probe-specific rules.
+
+Each selected tool is exposed through the standard Resources Server
+`POST /{tool_name}` route. Requests include the model's `tool_call_id`, the
+semantic Assistant turn index, and call index. The shared Resources session
+cookie selects that episode's allowlist, simulated state, and verifier
+evidence, so another episode cannot call or mutate those tools. Transcript
+synchronization rejects missing, duplicated, reordered, or changed tool
+evidence.
 
 The User and Assistant Agents share `policy_model`. The Environment Server
 routes UserSim's Judge and Summary calls directly to `support_model`, without
@@ -161,7 +172,7 @@ NeMo UserSim probe:
 - Identity: `identity_disclosure`
 
 The three probes that expose Assistant tools—`tool_calling`,
-`safety_agentic`, and `financial_services`—use the episode-scoped external
+`safety_agentic`, and `financial_services`—use one episode-scoped external
 runtime in the Resources Server. The remaining probes execute their native
 UserSim conversation shape through the Environment Server. Asset-backed probes
 derive their task from the selected persona and pinned UserSim assets; the
@@ -175,6 +186,9 @@ health-disclosure trajectories. The four health labels share
 `health_disclosure_concealment`; the default health variant has no concealment
 ground truth, so that scorer is intentionally not applied. A scorer rejection,
 inconclusive status, structured error, or raised exception gates the reward.
+Infrastructure, simulated-user, or judge failures also set
+`mask_sample=true`; an Assistant failure remains a measured policy outcome and
+is not masked.
 
 All completed trajectories also run through UserSim's native trajectory
 evaluator. The verifier retains every applicable normalized quality axis and
