@@ -47,15 +47,14 @@ from GitHub over SSH. The installation host needs access to
 
 ## Prerequisites
 
-Install NeMo Gym and activate its environment as described in [Installation](/get-started/installation). Then
-install the UserSim revision pinned by the environment:
+Install NeMo Gym and activate its environment as described in [Installation](/get-started/installation):
 
 ```bash
 source .venv/bin/activate
-
-uv pip install \
-  "nemo-usersim @ git+ssh://git@github.com/NVIDIA-NeMo/UserSim.git@dabc14c970aa5a60b8bbef36016fd6ddbed00bb6"
 ```
+
+Preparation runs the pinned UserSim revision in a preparation-only isolated environment. Runtime servers
+install the same revision into their own environments. Neither step modifies the Gym environment.
 
 Configure an OpenAI-compatible endpoint in a local repository-root `env.yaml`:
 
