@@ -115,7 +115,7 @@ jq . environments/usersim/data/example.jsonl
 
 ## Collect one rollout
 
-`--environment usersim --split example` selects the included 14-task example suite described above. Start
+`--environment usersim --split benchmark` selects the included 14-task example suite described above. Start
 with only the first task and one repeat:
 
 ```bash
@@ -124,7 +124,7 @@ capture_dir="$(pwd)/results/usersim/model-calls"
 
 gym eval run \
   --environment usersim \
-  --split example \
+  --split benchmark \
   --output results/usersim/rollouts.jsonl \
   --limit 1 \
   --num-repeats 1 \
