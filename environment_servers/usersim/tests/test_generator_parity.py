@@ -258,7 +258,7 @@ def _normalized_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 async def test_prepared_task_matches_standalone_generator_through_gym_stack(monkeypatch) -> None:
-    monkeypatch.setenv("USERSIM_CODE_SHA", USERSIM_REVISION)
+    monkeypatch.setattr("usersim.engine.core.episode_input.get_code_sha", lambda: USERSIM_REVISION)
     [resolved_row] = materialize_episode_inputs(
         locale="en_US",
         num_rows=1,
