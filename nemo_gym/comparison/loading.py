@@ -115,7 +115,11 @@ def _compute_repeat_metrics(entry: Dict[str, Any]) -> Dict[str, Any]:
     return entry | {
         "agent_metrics": computed.agent_metrics
         | (entry.get("agent_metrics") or {})
-        | {"num_repeats": _derive_num_repeats(entry.get("group_level_metrics", []), computed.repeat_level_metrics)},
+        | {
+            "num_repeats": _derive_num_repeats(
+                entry.get("group_level_metrics", []), computed.repeat_level_metrics, entry.get("agent_metrics")
+            )
+        },
         "repeat_level_metrics": computed.repeat_level_metrics,
     }
 
@@ -242,23 +246,26 @@ def resolve_agent_selections(
 def _derive_num_repeats(
     group_level_metrics: List[Dict[str, Any]],
     repeat_level_metrics: List[Dict[str, Any]],
+    agent_metrics: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
-    """How many repeats the run collected: the most any single task has.
+    """How many repeats the run collected across scored tasks, repeat rows, and run metadata.
 
     `expected_num_rollouts` is per task, and a partially recovered run leaves some tasks short of
-    the rest, so the max is the run's repeat count. `repeat_level_metrics` has exactly one entry
-    per repeat but is absent from single-repeat runs and from files written before it existed.
+    the rest, so the max is the run's repeat count. Performance metrics can add repeat rows for
+    masked rollouts absent from the scored task groups, so use whichever source records more.
     """
-    expected = [
+    counts = [
         group[EXPECTED_NUM_ROLLOUTS_KEY_NAME]
         for group in group_level_metrics
         if isinstance(group.get(EXPECTED_NUM_ROLLOUTS_KEY_NAME), int)
+        and not isinstance(group[EXPECTED_NUM_ROLLOUTS_KEY_NAME], bool)
     ]
-    if expected:
-        return max(expected)
     if repeat_level_metrics:
-        return len(repeat_level_metrics)
-    return None
+        counts.append(len(repeat_level_metrics))
+    recorded = (agent_metrics or {}).get("num_repeats")
+    if isinstance(recorded, int) and not isinstance(recorded, bool):
+        counts.append(recorded)
+    return max(counts) if counts else None
 
 
 def build_loaded_run(run_file: RunFile, agent_name: str) -> LoadedRun:
@@ -276,6 +283,6 @@ def build_loaded_run(run_file: RunFile, agent_name: str) -> LoadedRun:
         group_level_metrics=group_level_metrics,
         repeat_level_metrics=repeat_level_metrics,
         num_tasks=len(group_level_metrics),
-        num_repeats=_derive_num_repeats(group_level_metrics, repeat_level_metrics),
+        num_repeats=_derive_num_repeats(group_level_metrics, repeat_level_metrics, agent_metrics),
         has_repeat_cis=any(key.startswith(Stat.CI_LOW_95.across_repeats_prefix) for key in agent_metrics),
     )

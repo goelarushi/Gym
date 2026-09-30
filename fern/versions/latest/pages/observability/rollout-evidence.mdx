@@ -141,6 +141,7 @@ collection records `turns_unavailable` instead of inferring a turn from the mode
   },
   "ng_perf": {
     "num_turns": 1, "num_tool_calls": 1, "token_observability_coverage": 1.0,
+    "completion_tokens_complete": true,
     "prompt_tokens": 12, "completion_tokens": 8, "total_latency_ms": 910
   }
 }
@@ -174,7 +175,19 @@ files. They check evidence integrity; the verifier determines task success.
 owned model-call counts, then one per invocation. This fallback explains `num_turns: 1` in the
 example even though semantic turns are unavailable. Token totals include only observed values;
 `token_observability_coverage` reports matched calls divided by counted turns, capped at one.
+`completion_tokens_complete` is true only when every referenced call matches a distinct captured
+call, every matched call reports completion tokens, and those calls cover all counted turns.
 
 Collection adds measured wall-clock latency when available. `ng_perf` is absent when observability
 is disabled or no valid trajectory invocation exists. Aggregate metrics include `perf_summary`
 when rollouts contain `ng_perf`.
+
+The aggregate metrics file also reports `mean_completion_tokens` and `mean_tokens_per_turn` in
+`agent_metrics` and `key_metrics`. These use only rollouts with complete completion-token evidence,
+including rollouts whose quality score was masked. The first metric averages completion tokens per
+rollout; the second averages each rollout's `completion_tokens / num_turns`. With at least two
+repeats, the file reports a 95% interval across repeat means. `gym eval compare` always shows both
+rows and adds a Welch 95% interval for the candidate-minus-baseline difference when both runs have
+at least two observed repeats. Missing evidence or insufficient repeats display as unavailable
+values or intervals rather than zeroes. The older `perf_summary` retains its best-effort token
+totals, so its means may differ when some rollouts have partial usage.

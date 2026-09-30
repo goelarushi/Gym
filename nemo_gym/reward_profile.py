@@ -1065,6 +1065,81 @@ def _is_finite_number(value: Any) -> bool:
     return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
+_COMPLETION_TOKEN_METRICS = ("mean_completion_tokens", "mean_tokens_per_turn")
+
+
+def _add_completion_token_metrics(
+    profiler: RewardProfiler,
+    verify_responses: List[Dict[str, Any]],
+    repeat_level_metrics: List[Dict[str, Any]],
+    agent_metrics: Dict[str, Any],
+) -> Dict[str, float]:
+    """Summarize complete per-rollout token evidence, including masked rollouts.
+
+    A resolved model call can still lack usage. The collector marks a rollout complete
+    only when every agent-owned call supplied completion tokens, so partial sums never
+    become report metrics. The older perf_summary keeps its original raw semantics.
+    """
+    values: Dict[str, List[float]] = defaultdict(list)
+    by_repeat: Dict[int, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    all_repeat_indices = {vr.get(ROLLOUT_INDEX_KEY_NAME, 0) for vr in verify_responses}
+    all_task_indices = {vr.get(TASK_INDEX_KEY_NAME, 0) for vr in verify_responses}
+    tasks_by_repeat: Dict[int, set[int]] = defaultdict(set)
+
+    for response in verify_responses:
+        perf = response.get("ng_perf")
+        if not isinstance(perf, dict) or perf.get("completion_tokens_complete") is not True:
+            continue
+        tokens = perf.get("completion_tokens")
+        if not _is_finite_number(tokens) or tokens < 0:
+            continue
+
+        repeat_idx = response.get(ROLLOUT_INDEX_KEY_NAME, 0)
+        tasks_by_repeat[repeat_idx].add(response.get(TASK_INDEX_KEY_NAME, 0))
+        observations = {"mean_completion_tokens": float(tokens)}
+        turns = perf.get("num_turns")
+        if _is_finite_number(turns) and turns > 0:
+            ratio = float(tokens) / float(turns)
+            if math.isfinite(ratio):
+                observations["mean_tokens_per_turn"] = ratio
+        for name, value in observations.items():
+            values[name].append(value)
+            by_repeat[repeat_idx][name].append(value)
+
+    full_run = {name: statistics.fmean(observations) for name, observations in values.items() if observations}
+    agent_metrics.update(full_run)
+
+    # A single rollout index has no repeat-level uncertainty to summarize.
+    if len(all_repeat_indices) < 2:
+        return full_run
+
+    existing_by_repeat = {entry[ROLLOUT_INDEX_KEY_NAME]: entry for entry in repeat_level_metrics}
+    token_repeats = []
+    for repeat_idx, metric_values in sorted(by_repeat.items()):
+        token_row = {
+            AGENT_REF_KEY_NAME: {"name": "agent"},
+            ROLLOUT_INDEX_KEY_NAME: repeat_idx,
+            **{name: statistics.fmean(observations) for name, observations in metric_values.items()},
+        }
+        token_repeats.append(token_row)
+        row = existing_by_repeat.get(repeat_idx)
+        if row is None:
+            sample_count = len(tasks_by_repeat[repeat_idx])
+            row = {
+                AGENT_REF_KEY_NAME: {"name": "agent"},
+                ROLLOUT_INDEX_KEY_NAME: repeat_idx,
+                "sample_count": sample_count,
+                "missing_count": len(all_task_indices) - sample_count,
+            }
+            repeat_level_metrics.append(row)
+        row.update({name: token_row[name] for name in _COMPLETION_TOKEN_METRICS if name in token_row})
+
+    repeat_level_metrics.sort(key=lambda row: row[ROLLOUT_INDEX_KEY_NAME])
+    for aggregate in profiler._aggregate_repeat_level_metrics(token_repeats):
+        agent_metrics.update({name: value for name, value in aggregate.items() if name != AGENT_REF_KEY_NAME})
+    return full_run
+
+
 def _add_custom_repeat_metrics(
     profiler: RewardProfiler,
     verify_responses: List[Dict[str, Any]],
@@ -1143,8 +1218,21 @@ def compute_aggregate_metrics(
 
     if not scored:
         # Every rollout was masked. Publishing means over an empty set would invent a
-        # zero; report what happened instead.
-        return AggregateMetrics(agent_metrics=dict(coverage), key_metrics=dict(coverage), perf_summary=perf_summary)
+        # zero for quality, but completed rollouts can still carry token evidence.
+        rp = RewardProfiler()
+        agent_metrics = dict(coverage)
+        agent_metrics["num_repeats"] = len({vr.get(ROLLOUT_INDEX_KEY_NAME, 0) for vr in verify_responses})
+        repeat_level_metrics: List[Dict[str, Any]] = []
+        token_metrics = _add_completion_token_metrics(rp, verify_responses, repeat_level_metrics, agent_metrics)
+        return AggregateMetrics(
+            agent_metrics=agent_metrics,
+            key_metrics={**coverage, **token_metrics},
+            perf_summary=perf_summary,
+            repeat_level_metrics=[
+                {name: value for name, value in entry.items() if name != AGENT_REF_KEY_NAME}
+                for entry in repeat_level_metrics
+            ],
+        )
 
     rp = RewardProfiler()
 
@@ -1221,6 +1309,9 @@ def compute_aggregate_metrics(
             custom,
             compute_repeat_metrics_fn,
         )
+
+    token_metrics = _add_completion_token_metrics(rp, verify_responses, repeat_level_metrics, serialized_agent)
+    key_metrics.update(token_metrics)
 
     serialized_repeat_level_metrics = [
         {k: v for k, v in entry.items() if k != AGENT_REF_KEY_NAME} for entry in repeat_level_metrics

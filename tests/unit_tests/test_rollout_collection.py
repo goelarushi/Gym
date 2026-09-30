@@ -543,6 +543,7 @@ class TestRolloutCollection:
             "num_turns": 2,
             "num_tool_calls": 3,
             "token_observability_coverage": 1.0,
+            "completion_tokens_complete": False,
             "prompt_tokens": 150,
             "cached_prompt_tokens": 10,
             "completion_tokens": 25,
@@ -571,7 +572,36 @@ class TestRolloutCollection:
             "total_latency_ms",
         ):
             assert absent_key not in ng_perf
-        assert ng_perf == {"num_turns": 1, "num_tool_calls": 0, "token_observability_coverage": 0.0}
+        assert ng_perf == {
+            "num_turns": 1,
+            "num_tool_calls": 0,
+            "token_observability_coverage": 0.0,
+            "completion_tokens_complete": False,
+        }
+
+    def test_build_ng_perf_marks_partial_completion_usage_incomplete(self) -> None:
+        result = {
+            NG_TRAJECTORY_KEY: {
+                "task_id": "t",
+                "rollout_id": "t-0",
+                "invocations": [
+                    {
+                        "invocation_id": "root",
+                        "model_calls": [{"model_call_id": "complete"}, {"model_call_id": "missing-usage"}],
+                    }
+                ],
+                "model_calls": [
+                    {"model_call_id": "complete", "token_stats": {"completion_tokens": 10}},
+                    {"model_call_id": "missing-usage", "token_stats": {"prompt_tokens": 20}},
+                ],
+            }
+        }
+
+        ng_perf = _build_ng_perf(result, rollout_latency_ms=None)
+
+        assert ng_perf["completion_tokens"] == 10
+        assert ng_perf["token_observability_coverage"] == 1.0
+        assert ng_perf["completion_tokens_complete"] is False
 
     def test_build_ng_perf_dedupes_model_call_claimed_by_two_invocations(self) -> None:
         # Simulates a join_model_call_observations conflict: the losing invocation keeps an
@@ -600,6 +630,7 @@ class TestRolloutCollection:
         assert ng_perf["prompt_tokens"] == 100
         assert ng_perf["completion_tokens"] == 10
         assert ng_perf["token_observability_coverage"] == 0.5
+        assert ng_perf["completion_tokens_complete"] is False
 
     def test_ng_perf_matches_model_calls_by_response_id_pair_like_simple_agent(self) -> None:
         # Integration test: simple_agent sets result["ng_trajectory"] directly (see
@@ -641,6 +672,7 @@ class TestRolloutCollection:
 
         assert ng_perf["prompt_tokens"] == 100
         assert ng_perf["completion_tokens"] == 20
+        assert ng_perf["completion_tokens_complete"] is True
 
     def test_ng_perf_does_not_guess_an_ambiguous_response_id_match(self) -> None:
         # Two captured calls share the same (model_ref, response_id) pair -- the ref must
@@ -719,6 +751,7 @@ class TestRolloutCollection:
         assert ng_perf["num_turns"] == 3
         assert ng_perf["completion_tokens"] == 30
         assert ng_perf["token_observability_coverage"] == pytest.approx(1 / 3)
+        assert ng_perf["completion_tokens_complete"] is False
 
     def test_build_ng_perf_sums_turns_across_invocations_with_per_invocation_fallback(self) -> None:
         # Hybrid trajectory: "root" emits explicit TrajectoryTurn records (2 turns), "sub-a"
@@ -755,6 +788,7 @@ class TestRolloutCollection:
         assert ng_perf["num_turns"] == 7
         assert ng_perf["completion_tokens"] == 40
         assert ng_perf["token_observability_coverage"] == pytest.approx(4 / 7)
+        assert ng_perf["completion_tokens_complete"] is False
 
     def test_attach_ng_perf_absent_when_observability_disabled(self) -> None:
         result = {
@@ -784,6 +818,7 @@ class TestRolloutCollection:
             "num_turns": 1,
             "num_tool_calls": 0,
             "token_observability_coverage": 0.0,
+            "completion_tokens_complete": False,
             "total_latency_ms": 42.0,
         }
 

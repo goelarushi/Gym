@@ -309,6 +309,29 @@ class TestNumRepeatsDerivation:
         run = _load(tmp_path, "base", [_entry(groups=[_group(0, [1.0, 0.0, 1.0])])])
         assert run.num_repeats == 3
 
+    def test_perf_only_repeat_rows_extend_scored_repeat_count(self, tmp_path):
+        run = _load(
+            tmp_path,
+            "base",
+            [
+                _entry(
+                    groups=[_group(0, [1.0])],
+                    repeat_level_metrics=[
+                        {"_ng_rollout_index": index, "mean_completion_tokens": 100.0 + index} for index in range(3)
+                    ],
+                )
+            ],
+        )
+        assert run.num_repeats == 3
+
+    def test_agent_repeat_count_includes_masked_repeats_without_token_evidence(self, tmp_path):
+        run = _load(
+            tmp_path,
+            "base",
+            [_entry(agent_metrics={"mean/reward": 1.0, "num_repeats": 3}, groups=[_group(0, [1.0])])],
+        )
+        assert run.num_repeats == 3
+
     def test_falls_back_to_repeat_level_metrics(self, tmp_path):
         groups = [{"_ng_task_index": 0, "mean/reward": 1.0}]
         repeat_level_metrics = [{"_ng_rollout_index": i, "mean/reward": i / 4} for i in range(4)]
@@ -1246,10 +1269,14 @@ class TestEndToEnd:
             "Candidate",
             "Candidate 95% CI",
         ]
-        # Only key metrics get a row, and `[avg-of-k]` survives Rich markup escaping.
-        assert table.row_count == 1
-        assert "pass@1\\[avg-of-2]/accuracy" in list(table.columns[0].cells)
-        assert list(table.columns[2].cells) == ["—"]
+        # Completion-token rows remain visible even when observability supplied no values.
+        assert table.row_count == 3
+        assert list(table.columns[0].cells) == [
+            "pass@1\\[avg-of-2]/accuracy",
+            "mean_completion_tokens",
+            "mean_tokens_per_turn",
+        ]
+        assert list(table.columns[2].cells) == ["—", "—", "—"]
 
     @pytest.mark.parametrize(
         "groups, expected",
@@ -1371,9 +1398,9 @@ class TestReportEdgeCases:
 
         (table,) = render_key_metrics_tables(result)
         table_values = {column.header: list(column.cells) for column in table.columns}
-        assert table_values["Δ (cand − base)"] == [expected_delta]
-        assert table_values["Baseline"] == ["0.5000"]
-        assert table_values["Candidate"] == [expected_candidate]
+        assert table_values["Δ (cand − base)"][0] == expected_delta
+        assert table_values["Baseline"][0] == "0.5000"
+        assert table_values["Candidate"][0] == expected_candidate
 
     def test_missing_values_and_zero_baseline_render_placeholders(self, tmp_path):
         baseline = _entry(
@@ -1387,12 +1414,113 @@ class TestReportEdgeCases:
             groups=[_group(0, [0.0])],
         )
         markdown = render_markdown(self._result(tmp_path, baseline, candidate))
-        # No key metrics were recorded, and the one-sided metric has no delta to show.
-        assert "No key metrics were recorded for this agent." in markdown
+        # The one-sided metric has no delta, while the two completion-token rows stay visible.
+        assert "| `mean_completion_tokens` | — | — | — | — | — | — |" in markdown
+        assert "| `mean_tokens_per_turn` | — | — | — | — | — | — |" in markdown
         assert "| `pass@1/accuracy` | — | — | 10.00 | — | — | — |" in markdown
         # A zero baseline has no meaningful relative change.
         assert "| `mean/reward` | +0.5000 (n/a) |" in markdown
         assert "### Metrics present in only one run" in markdown
+
+    def test_completion_token_rows_are_in_json_without_token_observations(self, tmp_path):
+        baseline = _entry(agent_metrics={"mean/reward": 0.5}, key_metrics={})
+        candidate = _entry(agent_metrics={"mean/reward": 0.6}, key_metrics={})
+        result = self._result(tmp_path, baseline, candidate)
+
+        rows = {row.metric: row for row in result.comparisons[0].metrics}
+        for name in ("mean_completion_tokens", "mean_tokens_per_turn"):
+            assert rows[name].is_key_metric
+            assert rows[name].present_in == []
+            assert rows[name].baseline is None
+            assert rows[name].candidates == [None]
+
+        markdown = render_markdown(result)
+        assert "| `mean_completion_tokens` | — | — | — | — | — | — |" in markdown
+        assert "| `mean_tokens_per_turn` | — | — | — | — | — | — |" in markdown
+        assert "### Metrics present in only one run" not in markdown
+
+        (json_fpath,) = write_reports(result, tmp_path / "token_report", "json")
+        report_rows = {
+            row["metric"]: row for row in orjson.loads(json_fpath.read_bytes())["comparisons"][0]["metrics"]
+        }
+        for name in ("mean_completion_tokens", "mean_tokens_per_turn"):
+            assert report_rows[name]["baseline"] is None
+            assert report_rows[name]["candidates"] == [None]
+
+    def test_completion_token_metric_present_on_one_side_is_explained(self, tmp_path):
+        baseline = _entry(agent_metrics={"mean/reward": 0.5, "mean_completion_tokens": 100.0}, key_metrics={})
+        candidate = _entry(agent_metrics={"mean/reward": 0.6}, key_metrics={})
+        result = self._result(tmp_path, baseline, candidate)
+
+        row = next(row for row in result.comparisons[0].metrics if row.metric == "mean_completion_tokens")
+        assert row.is_key_metric
+        assert row.present_in == ["baseline"]
+        assert row.baseline.value == 100.0
+        assert row.candidates == [None]
+        markdown = render_markdown(result)
+        assert "| `mean_completion_tokens` | — | — | 100.00 | — | — | — |" in markdown
+        assert "- `mean_completion_tokens` — baseline" in markdown
+        assert "Missing observability data can leave token metrics unavailable." in markdown
+
+    def test_completion_token_rows_show_run_and_welch_intervals(self, tmp_path):
+        baseline = _entry(
+            agent_metrics={
+                "mean_completion_tokens": 110.0,
+                "mean_across_repeats/mean_completion_tokens": 110.0,
+                "ci_low_95_across_repeats/mean_completion_tokens": 100.0,
+                "ci_high_95_across_repeats/mean_completion_tokens": 120.0,
+                "mean_tokens_per_turn": 55.0,
+                "mean_across_repeats/mean_tokens_per_turn": 55.0,
+                "ci_low_95_across_repeats/mean_tokens_per_turn": 50.0,
+                "ci_high_95_across_repeats/mean_tokens_per_turn": 60.0,
+            },
+            key_metrics={},
+            repeat_level_metrics=[
+                {"mean_completion_tokens": 100.0, "mean_tokens_per_turn": 50.0},
+                {"mean_completion_tokens": 110.0, "mean_tokens_per_turn": 55.0},
+                {"mean_completion_tokens": 120.0, "mean_tokens_per_turn": 60.0},
+            ],
+        )
+        candidate = _entry(
+            agent_metrics={
+                "mean_completion_tokens": 140.0,
+                "mean_across_repeats/mean_completion_tokens": 140.0,
+                "ci_low_95_across_repeats/mean_completion_tokens": 120.0,
+                "ci_high_95_across_repeats/mean_completion_tokens": 160.0,
+                "mean_tokens_per_turn": 70.0,
+                "mean_across_repeats/mean_tokens_per_turn": 70.0,
+                "ci_low_95_across_repeats/mean_tokens_per_turn": 55.0,
+                "ci_high_95_across_repeats/mean_tokens_per_turn": 85.0,
+            },
+            key_metrics={},
+            repeat_level_metrics=[
+                {"mean_completion_tokens": 130.0, "mean_tokens_per_turn": 60.0},
+                {"mean_completion_tokens": 140.0, "mean_tokens_per_turn": 70.0},
+                {"mean_completion_tokens": 150.0, "mean_tokens_per_turn": 80.0},
+            ],
+        )
+        result = self._result(tmp_path, baseline, candidate)
+        rows = {row.metric: row for row in result.comparisons[0].metrics}
+        for name, expected_delta, baseline_ci, candidate_ci in (
+            ("mean_completion_tokens", 30.0, (100.0, 120.0), (120.0, 160.0)),
+            ("mean_tokens_per_turn", 15.0, (50.0, 60.0), (55.0, 85.0)),
+        ):
+            row = rows[name]
+            assert row.is_key_metric
+            assert row.present_in == ["baseline", "candidate[0]"]
+            assert (row.baseline.ci_low, row.baseline.ci_high) == baseline_ci
+            assert (row.candidates[0].ci_low, row.candidates[0].ci_high) == candidate_ci
+            assert row.candidates[0].delta == pytest.approx(expected_delta)
+            assert row.candidates[0].delta_ci_low < expected_delta < row.candidates[0].delta_ci_high
+            assert (row.candidates[0].delta_ci_low + row.candidates[0].delta_ci_high) / 2 == pytest.approx(
+                expected_delta
+            )
+
+        markdown = render_markdown(result)
+        assert "| `mean_completion_tokens` | +30.00 (+27.3%) |" in markdown
+        assert "| `mean_tokens_per_turn` | +15.00 (+27.3%) |" in markdown
+        assert "[100.00, 120.00]" in markdown
+        assert "[120.00, 160.00]" in markdown
 
     def test_continuous_mode_section(self, tmp_path):
         baseline = _entry(groups=[_group(0, [0.20]), _group(1, [0.90])])

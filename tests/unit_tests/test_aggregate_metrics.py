@@ -1134,6 +1134,122 @@ class TestPerfSummaryInAggregateMetrics:
         assert result.perf_summary["token_observability_coverage"] == 0.0
 
 
+class TestCompletionTokenMetrics:
+    def test_complete_observations_produce_headline_values_and_repeat_intervals(self) -> None:
+        tokens_and_turns = {
+            (0, 0): (4, 1),
+            (1, 0): (8, 2),
+            (0, 1): (12, 2),
+            (1, 1): (20, 4),
+        }
+        responses = [
+            {
+                TASK_INDEX_KEY_NAME: task_idx,
+                ROLLOUT_INDEX_KEY_NAME: repeat_idx,
+                "reward": 1.0,
+                "ng_perf": {
+                    "completion_tokens": tokens,
+                    "num_turns": turns,
+                    "completion_tokens_complete": True,
+                },
+            }
+            for (task_idx, repeat_idx), (tokens, turns) in tokens_and_turns.items()
+        ]
+
+        result = compute_aggregate_metrics(
+            responses,
+            get_key_metrics_fn=lambda metrics: {"mean/reward": metrics["mean/reward"]},
+        )
+
+        assert result.agent_metrics["mean_completion_tokens"] == pytest.approx(11.0)
+        assert result.agent_metrics["mean_tokens_per_turn"] == pytest.approx(4.75)
+        assert result.key_metrics["mean_completion_tokens"] == pytest.approx(11.0)
+        assert result.key_metrics["mean_tokens_per_turn"] == pytest.approx(4.75)
+        assert [row["mean_completion_tokens"] for row in result.repeat_level_metrics] == pytest.approx([6.0, 16.0])
+        assert [row["mean_tokens_per_turn"] for row in result.repeat_level_metrics] == pytest.approx([4.0, 5.5])
+        for metric, expected in (("mean_completion_tokens", 11.0), ("mean_tokens_per_turn", 4.75)):
+            assert result.agent_metrics[f"mean_across_repeats/{metric}"] == pytest.approx(expected)
+            assert result.agent_metrics[f"ci_low_95_across_repeats/{metric}"] < expected
+            assert result.agent_metrics[f"ci_high_95_across_repeats/{metric}"] > expected
+
+    def test_incomplete_usage_and_zero_turns_do_not_create_false_token_values(self) -> None:
+        responses = [
+            {
+                TASK_INDEX_KEY_NAME: 0,
+                ROLLOUT_INDEX_KEY_NAME: 0,
+                "reward": 1.0,
+                "ng_perf": {"completion_tokens": 10, "num_turns": 2, "completion_tokens_complete": True},
+            },
+            {
+                TASK_INDEX_KEY_NAME: 1,
+                ROLLOUT_INDEX_KEY_NAME: 0,
+                "reward": 1.0,
+                "ng_perf": {"completion_tokens": 1000, "num_turns": 1, "completion_tokens_complete": False},
+            },
+            {
+                TASK_INDEX_KEY_NAME: 0,
+                ROLLOUT_INDEX_KEY_NAME: 1,
+                "reward": 1.0,
+                "ng_perf": {"completion_tokens": 20, "num_turns": 0, "completion_tokens_complete": True},
+            },
+            {
+                TASK_INDEX_KEY_NAME: 1,
+                ROLLOUT_INDEX_KEY_NAME: 1,
+                "reward": 1.0,
+                "ng_perf": {"completion_tokens": 200, "num_turns": 1},
+            },
+        ]
+
+        result = compute_aggregate_metrics(responses)
+
+        assert result.agent_metrics["mean_completion_tokens"] == pytest.approx(15.0)
+        assert result.agent_metrics["mean_tokens_per_turn"] == pytest.approx(5.0)
+        assert [row["mean_completion_tokens"] for row in result.repeat_level_metrics] == pytest.approx([10.0, 20.0])
+        assert "mean_tokens_per_turn" not in result.repeat_level_metrics[1]
+        assert "ci_low_95_across_repeats/mean_completion_tokens" in result.agent_metrics
+        assert "ci_low_95_across_repeats/mean_tokens_per_turn" not in result.agent_metrics
+        # The legacy perf_summary still describes every reported token field, including partial sums.
+        assert result.perf_summary["mean_completion_tokens"] == pytest.approx(307.5)
+
+    def test_masked_rollouts_supply_token_repeats_without_quality_scores(self) -> None:
+        responses = [
+            {
+                TASK_INDEX_KEY_NAME: 0,
+                ROLLOUT_INDEX_KEY_NAME: 0,
+                "reward": 1.0,
+                "mask_sample": True,
+                "ng_perf": {"completion_tokens": 10, "num_turns": 2, "completion_tokens_complete": True},
+            },
+            {
+                TASK_INDEX_KEY_NAME: 1,
+                ROLLOUT_INDEX_KEY_NAME: 0,
+                "reward": 0.0,
+                "mask_sample": True,
+                "ng_perf": {"completion_tokens": 20, "num_turns": 2, "completion_tokens_complete": True},
+            },
+            {
+                TASK_INDEX_KEY_NAME: 0,
+                ROLLOUT_INDEX_KEY_NAME: 1,
+                "reward": 0.0,
+                "mask_sample": True,
+                "ng_perf": {"completion_tokens": 30, "num_turns": 3, "completion_tokens_complete": True},
+            },
+            {TASK_INDEX_KEY_NAME: 1, ROLLOUT_INDEX_KEY_NAME: 1, "reward": 0.0, "mask_sample": True},
+        ]
+
+        result = compute_aggregate_metrics(responses)
+
+        assert "mean/reward" not in result.key_metrics
+        assert result.agent_metrics["num_repeats"] == 2
+        assert result.key_metrics["mean_completion_tokens"] == pytest.approx(20.0)
+        assert result.key_metrics["mean_tokens_per_turn"] == pytest.approx(25.0 / 3.0)
+        assert [row["mean_completion_tokens"] for row in result.repeat_level_metrics] == pytest.approx([15.0, 30.0])
+        assert [row["sample_count"] for row in result.repeat_level_metrics] == [2, 1]
+        assert [row["missing_count"] for row in result.repeat_level_metrics] == [0, 1]
+        assert "ci_low_95_across_repeats/mean_completion_tokens" in result.agent_metrics
+        assert "ci_high_95_across_repeats/mean_tokens_per_turn" in result.agent_metrics
+
+
 class TestMaskedSamplesAreNotScored:
     """A masked sample is a completed rollout whose reward is not a valid measurement."""
 

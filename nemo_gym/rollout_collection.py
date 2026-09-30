@@ -746,6 +746,11 @@ def _build_ng_perf(result: dict[str, Any], *, rollout_latency_ms: Optional[float
     ``token_observability_coverage`` reports what fraction of those turns actually resolved to a
     captured call: a turn whose ``ModelCallRef`` was unmatched or ambiguous silently loses its
     tokens from the sums below, and this is the only signal that it happened.
+
+    ``completion_tokens_complete`` is true only when every referenced model call resolved to
+    a distinct captured call, every one reported completion-token usage, and captured calls
+    cover all counted turns. The token sum remains best-effort for backward compatibility;
+    callers computing confidence intervals can use this flag to exclude partial observations.
     """
     raw_trajectory = result.get(NG_TRAJECTORY_KEY)
     if not isinstance(raw_trajectory, dict):
@@ -829,6 +834,10 @@ def _build_ng_perf(result: dict[str, Any], *, rollout_latency_ms: Optional[float
         "num_turns": num_turns,
         "num_tool_calls": num_tool_calls,
         "token_observability_coverage": min(1.0, len(owned_calls) / num_turns),
+        "completion_tokens_complete": bool(owned_calls)
+        and len(owned_calls) == sum(len(invocation.model_calls) for invocation in trajectory.invocations)
+        and len(owned_calls) >= num_turns
+        and all(call.token_stats.completion_tokens is not None for call in owned_calls),
     }
     for ng_perf_key, token_stats_attr in (
         ("prompt_tokens", "prompt_tokens"),

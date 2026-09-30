@@ -47,6 +47,9 @@ TASK_MIN_KEY = f"{Stat.MIN.prefix}{FLIP_FIELD}"
 TASK_MAX_KEY = f"{Stat.MAX.prefix}{FLIP_FIELD}"
 # A task "passes" when the majority of its repeats scored a pass.
 PASS_THRESHOLD = 0.5
+# These observability metrics are always shown in the report, even when a run did not
+# record enough token usage to calculate a value.
+COMPLETION_TOKEN_METRICS = ("mean_completion_tokens", "mean_tokens_per_turn")
 
 
 def _is_number(value: Any) -> bool:
@@ -158,7 +161,11 @@ def build_metric_rows(baseline: LoadedRun, candidates: Sequence[LoadedRun]) -> L
 
     baseline_metrics = {**baseline.key_metrics, **baseline.agent_metrics}
     candidate_metrics = [{**run.key_metrics, **run.agent_metrics} for run in candidates]
-    key_metric_names = set(baseline.key_metrics) | {name for run in candidates for name in run.key_metrics}
+    key_metric_names = (
+        set(baseline.key_metrics)
+        | {name for run in candidates for name in run.key_metrics}
+        | set(COMPLETION_TOKEN_METRICS)
+    )
 
     rows: List[MetricRow] = []
     for name in _ordered_metric_names(baseline_metrics, candidate_metrics):
@@ -372,6 +379,13 @@ def compare_runs(baseline: LoadedRun, candidates: Sequence[LoadedRun]) -> AgentC
             "Runs collected with different --num-repeats produce different pass@k metric names."
         )
 
+    reported = {row.metric for row in rows}
+    rows.extend(
+        MetricRow(metric=name, is_key_metric=True, present_in=[], candidates=[None] * len(candidates))
+        for name in COMPLETION_TOKEN_METRICS
+        if name not in reported
+    )
+
     notes: List[str] = []
     repeat_counts = [run.num_repeats for run in candidates]
     if baseline.num_repeats is not None and any(
@@ -387,7 +401,7 @@ def compare_runs(baseline: LoadedRun, candidates: Sequence[LoadedRun]) -> AgentC
             "Neither run recorded per-run cross-repeat confidence intervals, so every baseline/candidate "
             "CI cell is empty. They are written for repeat-aggregated metrics when a run has 2 or more repeats."
         )
-    one_sided = [row.metric for row in rows if len(row.present_in) < 1 + len(candidates)]
+    one_sided = [row.metric for row in rows if row.present_in and len(row.present_in) < 1 + len(candidates)]
     if one_sided:
         notes.append(f"{len(one_sided)} metric(s) were reported by only one of the runs.")
 
