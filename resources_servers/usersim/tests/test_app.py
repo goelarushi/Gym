@@ -77,7 +77,7 @@ def _write_personas(cache_dir: Path) -> None:
     manifest = {
         "locale": "en_US",
         "personas_dataset_version": "0.0.2",
-        "usersim_revision": "3a928ef8b4f5f8e7740bde213606443ccf04e6b1",
+        "usersim_revision": "2d9ec0d7c32ac800f2171b5943382a7b1eb96cbc",
         "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
         "panel_size_bytes": panel_path.stat().st_size,
         "panel_rows": len(PERSONAS),
@@ -131,7 +131,7 @@ def _seed_body(*, cache_dir: Path, seed: int, probe_type: str | None = None) -> 
                 "seed": seed,
                 "personas_dataset_version": "0.0.2",
                 "personas_panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
-                "usersim_revision": "3a928ef8b4f5f8e7740bde213606443ccf04e6b1",
+                "usersim_revision": "2d9ec0d7c32ac800f2171b5943382a7b1eb96cbc",
             },
         },
     }

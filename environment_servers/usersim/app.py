@@ -76,6 +76,7 @@ from resources_servers.usersim.episode_contracts import (
     UserSimVerificationInput,
     UserSimVerifyRequest,
 )
+from resources_servers.usersim.response_format import responses_json_schema
 
 
 _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
@@ -607,12 +608,13 @@ def _apply_activation_parameters(
         json_schema = response_format.get("json_schema")
         if response_format.get("type") != "json_schema" or not isinstance(json_schema, Mapping):
             raise NotImplementedError(f"Unsupported response format: {response_format!r}")
+        strict = json_schema.get("strict", True)
         values["text"] = {
             "format": {
                 "type": "json_schema",
                 "name": json_schema["name"],
-                "schema": json_schema["schema"],
-                "strict": json_schema.get("strict", True),
+                "schema": responses_json_schema(json_schema["schema"], strict=strict),
+                "strict": strict,
             }
         }
 

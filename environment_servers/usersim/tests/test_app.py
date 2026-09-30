@@ -11,6 +11,7 @@ from pydantic import ConfigDict
 from environment_servers.usersim.app import (
     UserSimEnvironmentServer,
     UserSimEnvironmentServerConfig,
+    _apply_activation_parameters,
     _ConversationBridge,
     _is_retryable_dependency_error,
     _response_output_messages,
@@ -422,6 +423,39 @@ def test_assistant_activation_preserves_complete_tool_transcript() -> None:
     assert transcript[0]["tool_calls"][0]["id"] == "call-1"
     assert transcript[0]["reasoning_content"] == "Inspect the tool result."
     assert transcript[1]["tool_call_id"] == "call-1"
+
+
+def test_strict_response_format_requires_all_nullable_fields_and_forbids_extras() -> None:
+    values: dict[str, Any] = {}
+    _apply_activation_parameters(
+        values,
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "safety_agentic_judgment",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "score": {
+                                "anyOf": [{"enum": [1, 2, 3, 4, 5], "type": "integer"}, {"type": "null"}],
+                                "default": None,
+                            },
+                            "reasoning": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+                        },
+                    },
+                },
+            }
+        },
+        assistant_tools=None,
+    )
+
+    schema = values["text"]["format"]["schema"]
+    assert values["text"]["format"]["strict"] is True
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["score", "reasoning"]
+    assert "default" not in schema["properties"]["score"]
+    assert "default" not in schema["properties"]["reasoning"]
 
 
 async def test_conversation_bridge_rejects_role_alias_mismatch_before_invocation() -> None:
