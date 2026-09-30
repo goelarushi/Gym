@@ -67,8 +67,6 @@ LOG = logging.getLogger(__name__)
 
 _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
 TOOL_CALL_ID_HEADER = "X-NeMo-Gym-Tool-Call-Id"
-TOOL_TURN_INDEX_HEADER = "X-NeMo-Gym-Turn-Index"
-TOOL_CALL_INDEX_HEADER = "X-NeMo-Gym-Call-Index"
 
 
 def _merge_cookie_values(current: Mapping[str, str] | None, updates: Mapping[str, Any]) -> dict[str, str]:
@@ -102,6 +100,7 @@ class _SimpleAgentSession:
     episode_id: Any
     task_id: Any
     resources_cookies: dict[str, str]
+    tool_batch_path: str | None = None
     tool_loop_policy: AgentToolLoopPolicy | None = None
     trajectories: list[TrajectoryRecord] = field(default_factory=list)
 
@@ -131,6 +130,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             episode_id=body.episode_id,
             task_id=body.task_id,
             resources_cookies=resources_cookies,
+            tool_batch_path=direct_accesses[0].batch_path if direct_accesses else None,
             tool_loop_policy=body.tool_loop_policy,
         )
         return AgentSeedSessionResponse(agent_session_id=body.agent_session_id)
@@ -176,8 +176,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         rollout_id: str = "unscoped",
         collect_trajectory: bool = False,
         invocation_id: str = "root",
-        activation_idx: int = 0,
         tool_loop_policy: AgentToolLoopPolicy | None = None,
+        tool_batch_path: str | None = None,
     ) -> tuple[NeMoGymResponse, TrajectoryRecord | None, Any, Any]:
         tool_records: list[TrajectoryToolCall] = []
         model_calls: list[ModelCallRef] = []
@@ -313,31 +313,66 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     )
                 break
 
+            parsed_calls: list[tuple[NeMoGymResponseFunctionToolCall, dict[str, Any]]] = []
+            parse_errors: dict[str, str] = {}
             for output_function_call in all_fn_calls:
-                call_idx = executed_call_count
+                try:
+                    parsed_calls.append((output_function_call, json.loads(output_function_call.arguments)))
+                except (json.JSONDecodeError, TypeError) as error:
+                    parse_errors[output_function_call.call_id] = json.dumps(
+                        {"error": f"Invalid tool call arguments: {error!r}"}
+                    )
+
+            batch_outputs: dict[str, str] = {}
+            if tool_batch_path is not None and len(parsed_calls) > 1:
+                batch_response = await self.server_client.post(
+                    server_name=self.config.resources_server.name,
+                    url_path=tool_batch_path,
+                    json=[
+                        {
+                            "tool_call_id": call.call_id,
+                            "tool_name": call.name,
+                            "arguments": arguments,
+                        }
+                        for call, arguments in parsed_calls
+                    ],
+                    cookies=resources_server_cookies,
+                )
+                payloads = await get_response_json(batch_response)
+                if not isinstance(payloads, list) or len(payloads) != len(parsed_calls):
+                    raise RuntimeError("Resources tool batch returned an invalid payload list")
+                batch_outputs = {
+                    call.call_id: str(payload) for (call, _), payload in zip(parsed_calls, payloads, strict=True)
+                }
+                resources_server_cookies = _merge_cookie_values(resources_server_cookies, batch_response.cookies)
+
+            for output_function_call in all_fn_calls:
                 executed_call_count += 1
                 if collect_trajectory:
                     started_at = time()
                     started_monotonic = perf_counter()
-                try:
-                    parsed_arguments = json.loads(output_function_call.arguments)
-                except (json.JSONDecodeError, TypeError) as e:
-                    tool_output = json.dumps({"error": f"Invalid tool call arguments: {e!r}"})
+                if output_function_call.call_id in parse_errors:
+                    tool_output = parse_errors[output_function_call.call_id]
                     if collect_trajectory:
-                        error_type = type(e).__name__
+                        error_type = "invalid_arguments"
                         tool_status = "failed"
+                elif output_function_call.call_id in batch_outputs:
+                    tool_output = batch_outputs[output_function_call.call_id]
+                    if collect_trajectory:
+                        completed = 200 <= batch_response.status < 400
+                        tool_status = "completed" if completed else "failed"
+                        error_type = None if completed else f"http_{batch_response.status}"
                 else:
+                    parsed_arguments = next(
+                        arguments for call, arguments in parsed_calls if call.call_id == output_function_call.call_id
+                    )
                     # Resource-server errors are valid model-visible tool outputs.
                     api_response = await self.server_client.post(
                         server_name=self.config.resources_server.name,
                         url_path=f"/{output_function_call.name}",
                         json=parsed_arguments,
                         cookies=resources_server_cookies,
-                        headers={
-                            TOOL_CALL_ID_HEADER: output_function_call.call_id,
-                            TOOL_TURN_INDEX_HEADER: str(activation_idx),
-                            TOOL_CALL_INDEX_HEADER: str(call_idx),
-                        },
+                        headers={TOOL_CALL_ID_HEADER: output_function_call.call_id},
                     )
                     tool_output = (await api_response.content.read()).decode()
                     resources_server_cookies = _merge_cookie_values(resources_server_cookies, api_response.cookies)
@@ -437,8 +472,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             rollout_id=rollout_id or "unscoped",
             collect_trajectory=collect_trajectory,
             invocation_id=f"activation-{len(session.trajectories)}" if session is not None else "root",
-            activation_idx=len(session.trajectories) if session is not None else 0,
             tool_loop_policy=session.tool_loop_policy if session is not None else None,
+            tool_batch_path=session.tool_batch_path if session is not None else None,
         )
         if session is not None:
             session.resources_cookies = dict(resources_server_cookies)

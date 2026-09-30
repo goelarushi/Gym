@@ -1,768 +1,239 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import hashlib
-import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from nemo_gym.server_utils import ServerClient
-from resources_servers.usersim.app import (
-    PROBE_SCORERS,
-    SUPPORTED_PROBES,
-    UserSimResourcesServer,
-    UserSimResourcesServerConfig,
-)
+from resources_servers.usersim.app import UserSimResourcesServer, UserSimResourcesServerConfig
 
 
-_ORIGINAL_EVALUATE_ASSISTANT_QUALITY = UserSimResourcesServer._evaluate_assistant_quality
-
-PERSONAS = [
-    {
-        "first_name": "Morgan",
-        "last_name": "Lee",
-        "age": 42,
-        "occupation": "building_inspector",
-        "persona": "Morgan is a practical and detail-oriented building inspector.",
-    },
-    {
-        "first_name": "Avery",
-        "last_name": "Patel",
-        "age": 31,
-        "occupation": "teacher",
-        "persona": "Avery is a patient teacher who enjoys explaining unfamiliar topics.",
-    },
-]
-EXAMPLES_PATH = Path(__file__).parents[1] / "data" / "example_source.jsonl"
+USERSIM_REVISION = "4fd4c800bbef8883329543df632f328860fc6429"
 
 
-@pytest.fixture(autouse=True)
-def _stub_assistant_quality(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def evaluate_quality(*_args, **_kwargs):
-        scores = {"helpfulness": 1.0, "accuracy": 1.0, "coherence": 1.0}
-        return (
-            {
-                "envelope": {"axes": list(scores)},
-                "axes": {},
-                "scorers": {},
-                "skipped": False,
-                "skipped_reason": None,
-            },
-            scores,
-            1.0,
-        )
-
-    monkeypatch.setattr(UserSimResourcesServer, "_evaluate_assistant_quality", evaluate_quality)
-
-
-def _write_parquet(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(PERSONAS), path)
-
-
-def _panel_path(cache_dir: Path) -> Path:
-    return cache_dir / "0.0.2" / "panels" / "en_US.parquet"
-
-
-def _write_personas(cache_dir: Path) -> None:
-    panel_path = _panel_path(cache_dir)
-    _write_parquet(panel_path)
-    manifest = {
+def _resolved_row(probe_type: str = "safety_agentic") -> dict:
+    return {
+        "probe_type": probe_type,
+        "probe_family": probe_type,
+        "probe_variant": "default",
+        "persona": {"first_name": "Morgan", "age": 42},
         "locale": "en_US",
-        "personas_dataset_version": "0.0.2",
-        "usersim_revision": "2d9ec0d7c32ac800f2171b5943382a7b1eb96cbc",
-        "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
-        "panel_size_bytes": panel_path.stat().st_size,
-        "panel_rows": len(PERSONAS),
-        "generator": "usersim panel",
+        "conversation_language": "English",
+        "trajectory_id": f"usersim-{probe_type}",
+        "usersim_provenance": {"code_sha": USERSIM_REVISION},
+        "usersim_config": {"random_seed": 42},
     }
-    panel_path.with_suffix(".manifest.json").write_text(json.dumps(manifest))
 
 
-def _app(
-    cache_dir: Path,
-    *,
-    with_probe_scorer_model: bool = False,
-) -> FastAPI:
-    config = UserSimResourcesServerConfig(
-        host="127.0.0.1",
-        port=12345,
-        entrypoint="app.py",
-        name="usersim",
-        personas_cache_dir=cache_dir,
-        probe_scorer_model=(
-            {"type": "responses_api_models", "name": "support_model"} if with_probe_scorer_model else None
-        ),
-    )
-    return UserSimResourcesServer(
-        config=config,
-        server_client=MagicMock(spec=ServerClient),
-    ).setup_webserver()
-
-
-def _seed_body(*, cache_dir: Path, seed: int, probe_type: str | None = None) -> dict:
-    probe_type = probe_type or "general_open_ended"
-    panel_path = _panel_path(cache_dir)
+def _seed_body(row: dict | None = None) -> dict:
     return {
         "resources_session_id": "resources-session-0",
         "episode_id": {"rollout_id": "0-0", "attempt": 0},
         "task_id": {"taskset": "usersim:example", "task_id": "0"},
-        "task_data": {
-            "scenario": {
-                "locale": "en_US",
-                "persona": PERSONAS[0],
-                "probe_type": probe_type,
-                "theme": {
-                    "type": probe_type.replace("_", " "),
-                    "description": f"Run the {probe_type} probe.",
+        "task_data": {"resolved_row": row or _resolved_row()},
+    }
+
+
+def _descriptor(*, tools: bool = False) -> SimpleNamespace:
+    assistant_tools = (
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "safe_action",
+                    "description": "Perform an action.",
+                    "parameters": {"type": "object", "properties": {}},
                 },
-                "goal": f"Run the {probe_type} probe.",
-                "probe_data": {},
-            },
-            "usersim_context": {
-                "locale": "en_US",
-                "seed": seed,
-                "personas_dataset_version": "0.0.2",
-                "personas_panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
-                "usersim_revision": "2d9ec0d7c32ac800f2171b5943382a7b1eb96cbc",
-            },
-        },
-    }
-
-
-def _verify_body(seed_result: dict) -> dict:
-    return {
-        "episode_id": {"rollout_id": "0-0", "attempt": 0},
-        "task_id": {"taskset": "usersim:example", "task_id": "0"},
-        "verification_input": {
-            "scenario": seed_result["scenario"],
-            "usersim_context": seed_result["usersim_context"],
-            "usersim_result": {
-                "conversation_messages": [
-                    {"role": "user", "content": "Teach me about local ecology."},
-                    {"role": "assistant", "content": "Here is an explanation."},
-                ],
-                "conversation_status": True,
-                "simulation_outcome": {"status": "completed"},
-            },
-            "invocations": [],
-            "episode_interaction_protocol": "usersim.ConversationLoop",
-        },
-    }
-
-
-def test_seed_session_resolves_replayable_scenario(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        first = client.post(
-            "/seed_session", json=_seed_body(cache_dir=tmp_path, seed=7, probe_type="general_open_ended")
-        )
-        second = client.post(
-            "/seed_session", json=_seed_body(cache_dir=tmp_path, seed=7, probe_type="general_open_ended")
-        )
-
-    assert first.status_code == 200
-    assert first.json()["usersim_context"] == second.json()["usersim_context"]
-    assert first.json()["usersim_context"]["personas_dataset_version"] == "0.0.2"
-    assert len(first.json()["usersim_context"]["personas_panel_sha256"]) == 64
-    assert first.json()["usersim_context"]["usersim_revision"] == (
-        "2d9ec0d7c32ac800f2171b5943382a7b1eb96cbc"  # pragma: allowlist secret
+            }
+        ]
+        if tools
+        else []
     )
-    scenario = first.json()["scenario"]
-    assert scenario["persona"]["first_name"] == "Morgan"
-    assert scenario["probe_type"] == "general_open_ended"
-    assert scenario["goal"] == "Run the general_open_ended probe."
-    assert "personas_dataset_version" not in scenario
+    return SimpleNamespace(
+        to_dict=lambda: {
+            "probe_type": "safety_agentic",
+            "assistant_tools": assistant_tools,
+            "allowed_tool_names": ["safe_action"] if tools else [],
+            "initial_user_message": "Do the task.",
+            "loop_policy": {
+                "tool_round_mode": "multi",
+                "max_assistant_activations": 2,
+                "final_synthesis_without_tools": False,
+                "single_user_turn": True,
+                "assistant_error_behavior": "fail_episode",
+                "tool_error_behavior": "return_error_payload",
+                "max_tool_response_attempts": 1,
+                "assistant_resampling": False,
+            },
+            "user_system_prompt": "",
+            "assistant_system_prompt": "",
+            "turn0_user_query_instruction": None,
+            "user_interaction_style": "direct",
+            "patience": 0.5,
+            "user_turn_policy": {
+                "context_compression": True,
+                "wrap_up": True,
+                "followup_anchor": None,
+                "allowed_phrases": [],
+                "script_check_ignores": [],
+                "check_opening": "none",
+            },
+        }
+    )
 
 
-def test_seed_uses_resolved_probe_without_runtime_selection(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        response = client.post("/seed_session", json=_seed_body(cache_dir=tmp_path, seed=19))
-
-    assert response.status_code == 200
-    assert response.json()["scenario"]["probe_type"] == "general_open_ended"
+def _runtime(*, tools: bool = False) -> MagicMock:
+    runtime = MagicMock()
+    runtime.descriptor = AsyncMock(return_value=_descriptor(tools=tools))
+    runtime.evidence = AsyncMock(return_value={"result_extras": {}})
+    return runtime
 
 
-def test_examples_cover_every_supported_probe() -> None:
-    rows = [json.loads(line) for line in EXAMPLES_PATH.read_text().splitlines()]
-    assert {row["task_input"]["probe_type"] for row in rows} == SUPPORTED_PROBES
-    assert len({row["task_id"]["task_id"] for row in rows}) == len(rows)
-    tool_calling = next(row["task_input"] for row in rows if row["task_input"]["probe_type"] == "tool_calling")
-    assert tool_calling["probe_data"]["tools"][0]["function"]["name"] == "get_weather"
-
-
-def test_supported_probes_match_pinned_usersim_registry() -> None:
-    pytest.importorskip("usersim.engine.generator")
-    from usersim.engine.core.probes import known_probes
-
-    assert set(known_probes()) == SUPPORTED_PROBES
-
-
-def test_probe_scorers_cover_every_probe_with_a_dedicated_scorer() -> None:
-    assert set(PROBE_SCORERS) == SUPPORTED_PROBES - {"general_open_ended", "general_educational"}
-
-
-def test_protocol_defaults_match_canonical_runtime() -> None:
+def _app() -> UserSimResourcesServer:
     config = UserSimResourcesServerConfig(
         host="127.0.0.1",
         port=12345,
         entrypoint="app.py",
         name="usersim",
     )
-
-    assert config.protocol_config.context_compression is False
-    assert config.protocol_config.finance_retrieval_mode == "hybrid"
+    return UserSimResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
 
 
-def test_sessions_keep_independent_resolved_contexts(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    app = _app(tmp_path)
-    with TestClient(app) as first, TestClient(app) as second:
-        first_seed = first.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=1, probe_type="general_open_ended"),
-        ).json()
-        second_seed = second.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=2, probe_type="general_educational"),
-        ).json()
-
-    assert first_seed["usersim_context"]["seed"] != second_seed["usersim_context"]["seed"]
-    assert first_seed["scenario"]["probe_type"] == "general_open_ended"
-    assert second_seed["scenario"]["probe_type"] == "general_educational"
-
-
-def test_probe_tools_are_scoped_to_seeded_session(
-    tmp_path: Path,
+def test_resources_constructs_runtime_only_from_unchanged_resolved_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtimes = []
-
-    class Runtime:
-        assistant_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "safe_action",
-                    "description": "Perform a simulated action.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ]
-
-        def __init__(self) -> None:
-            self.finalize_calls = 0
-            self.transcripts = []
-            runtimes.append(self)
-
-        async def descriptor(self):
-            return SimpleNamespace(
-                to_dict=lambda: {
-                    "probe_type": "safety_agentic",
-                    "assistant_tools": self.assistant_tools,
-                    "allowed_tool_names": ["safe_action"],
-                    "initial_user_message": "Perform the safe action.",
-                    "loop_policy": {
-                        "tool_round_mode": "multi",
-                        "max_assistant_activations": 3,
-                        "final_synthesis_without_tools": False,
-                        "single_user_turn": True,
-                        "assistant_error_behavior": "fail_episode",
-                        "tool_error_behavior": "return_error_payload",
-                        "max_tool_response_attempts": 1,
-                        "assistant_resampling": False,
-                    },
-                    "user_system_prompt": "",
-                    "assistant_system_prompt": "",
-                    "turn0_user_query_instruction": None,
-                    "user_interaction_style": "direct",
-                    "patience": 0.5,
-                    "user_turn_policy": {
-                        "context_compression": True,
-                        "wrap_up": True,
-                        "followup_anchor": None,
-                        "allowed_phrases": [],
-                        "script_check_ignores": [],
-                        "check_opening": "none",
-                    },
-                }
-            )
-
-        async def simulate_tool_call(self, name, body, *, tool_call_id, turn_idx, call_idx):
-            if name != "safe_action":
-                raise ValueError(f"Tool {name!r} is not available")
-            return json.dumps(
-                {
-                    "session_seed": body["seed"],
-                    "tool_call_id": tool_call_id,
-                    "turn_idx": turn_idx,
-                    "call_idx": call_idx,
-                }
-            )
-
-        async def synchronize_transcript(self, messages):
-            self.transcripts.append(messages)
-
-        async def format_followup_user_instructions(self, _turn_idx):
-            return []
-
-        async def is_capitulation_detected(self):
-            return False
-
+    row = _resolved_row()
+    runtime = _runtime()
+    from_resolved_row = MagicMock(return_value=runtime)
     monkeypatch.setattr(
-        UserSimResourcesServer,
-        "_create_probe_runtime",
-        lambda *_args, **_kwargs: Runtime(),
+        "usersim.engine.core.episode_runtime.ProbeEpisodeRuntime.from_resolved_row",
+        from_resolved_row,
     )
-    _write_personas(tmp_path)
-    app = _app(tmp_path)
-    with TestClient(app) as first, TestClient(app) as second:
-        first_seed = first.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=1, probe_type="safety_agentic"),
-        )
-        second_seed = second.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=2, probe_type="safety_agentic"),
-        )
-        first_result = first.post(
-            "/safe_action",
-            json={"seed": 1},
-            headers={
-                "X-NeMo-Gym-Tool-Call-Id": "call-1",
-                "X-NeMo-Gym-Turn-Index": "0",
-                "X-NeMo-Gym-Call-Index": "0",
-            },
-        )
-        second_result = second.post(
-            "/safe_action",
-            json={"seed": 2},
-            headers={
-                "X-NeMo-Gym-Tool-Call-Id": "call-2",
-                "X-NeMo-Gym-Turn-Index": "1",
-                "X-NeMo-Gym-Call-Index": "3",
-            },
-        )
-        rejected = first.post(
-            "/other_action",
-            json={},
-            headers={
-                "X-NeMo-Gym-Tool-Call-Id": "call-3",
-                "X-NeMo-Gym-Turn-Index": "0",
-                "X-NeMo-Gym-Call-Index": "1",
-            },
-        )
-        missing_identity = first.post("/safe_action", json={"seed": 1})
 
-    assert len(runtimes) == 2
-    assert first_seed.json()["assistant_tools"][0]["function"]["name"] == "safe_action"
-    assert first_seed.json()["runtime_descriptor"]["loop_policy"]["max_assistant_activations"] == 3
-    assert second_seed.status_code == 200
-    assert first_result.json() == {
-        "session_seed": 1,
-        "tool_call_id": "call-1",
-        "turn_idx": 0,
-        "call_idx": 0,
-    }
-    assert second_result.json() == {
-        "session_seed": 2,
-        "tool_call_id": "call-2",
-        "turn_idx": 1,
-        "call_idx": 3,
-    }
-    assert rejected.status_code == 404
-    assert missing_identity.status_code == 422
+    with TestClient(_app().setup_webserver()) as client:
+        response = client.post("/seed_session", json=_seed_body(row))
+
+    assert response.status_code == 200
+    assert response.json()["resolved_row"] == row
+    from_resolved_row.assert_called_once()
+    assert from_resolved_row.call_args.args == (row,)
+    assert set(from_resolved_row.call_args.kwargs) == {"models"}
 
 
-def test_verify_finalizes_owned_runtime_once(
-    tmp_path: Path,
+def test_seed_rejects_wrong_revision_before_runtime_construction() -> None:
+    row = _resolved_row()
+    row["usersim_provenance"]["code_sha"] = "a" * 40
+
+    with TestClient(_app().setup_webserver()) as client:
+        response = client.post("/seed_session", json=_seed_body(row))
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Resolved row does not match the configured UserSim revision"
+
+
+def test_tool_http_preserves_plain_text_and_delegates_native_batch_indices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = MagicMock()
-    runtime.descriptor = AsyncMock(
-        return_value=SimpleNamespace(
-            to_dict=lambda: {
-                "probe_type": "safety_agentic",
-                "assistant_tools": [],
-                "allowed_tool_names": [],
-                "initial_user_message": "Do the task.",
-                "loop_policy": {
-                    "tool_round_mode": "multi",
-                    "max_assistant_activations": 2,
-                    "final_synthesis_without_tools": False,
-                    "single_user_turn": True,
-                    "assistant_error_behavior": "fail_episode",
-                    "tool_error_behavior": "return_error_payload",
-                    "max_tool_response_attempts": 1,
-                    "assistant_resampling": False,
-                },
-                "user_system_prompt": "",
-                "assistant_system_prompt": "",
-                "turn0_user_query_instruction": None,
-                "user_interaction_style": "direct",
-                "patience": 0.5,
-                "user_turn_policy": {
-                    "context_compression": True,
-                    "wrap_up": True,
-                    "followup_anchor": None,
-                    "allowed_phrases": [],
-                    "script_check_ignores": [],
-                    "check_opening": "none",
-                },
-            }
-        )
-    )
-    runtime.finalize = AsyncMock(
-        return_value={
-            "conversation_messages": [
-                {"role": "user", "content": "Do the task."},
-                {"role": "assistant", "content": "Done."},
-            ],
-            "conversation_status": True,
-            "simulation_outcome": {"status": "ok"},
-        }
-    )
-    runtime.evidence = AsyncMock(return_value={"result_extras": {}})
+    runtime = _runtime(tools=True)
+    runtime.simulate_tool_call = AsyncMock(return_value="plain safety payload")
+    runtime.simulate_tool_calls = AsyncMock(return_value=["first", "second"])
     monkeypatch.setattr(UserSimResourcesServer, "_create_probe_runtime", lambda *_args, **_kwargs: runtime)
 
-    async def score(*_args, **_kwargs):
-        return "safety_agentic", {"status_proposal": True}, True
-
-    monkeypatch.setattr(UserSimResourcesServer, "_score_native_result", score)
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        seed = client.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=42, probe_type="safety_agentic"),
-        ).json()
-        verified = client.post("/verify", json=_verify_body(seed))
-
-    assert verified.status_code == 200
-    runtime.finalize.assert_awaited_once_with()
-
-
-def test_native_safety_probe_exposes_and_simulates_selected_tools(tmp_path: Path) -> None:
-    pytest.importorskip("usersim.engine.core.episode_runtime")
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        seed = client.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=42, probe_type="safety_agentic"),
+    with TestClient(_app().setup_webserver()) as client:
+        assert client.post("/seed_session", json=_seed_body()).status_code == 200
+        single = client.post(
+            "/safe_action",
+            json={"value": "one"},
+            headers={"X-NeMo-Gym-Tool-Call-Id": "call-1"},
         )
-        activation = client.post("/runtime/start", json={})
-        tool_name = seed.json()["assistant_tools"][0]["function"]["name"]
-        assistant_call = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": "{}"},
-                }
-            ],
-        }
-        result = client.post(
-            f"/{tool_name}",
-            json={},
-            headers={
-                "X-NeMo-Gym-Tool-Call-Id": "call-1",
-                "X-NeMo-Gym-Turn-Index": "0",
-                "X-NeMo-Gym-Call-Index": "0",
-            },
-        )
-        transcript = [
-            assistant_call,
-            {"role": "tool", "content": json.dumps(result.json()), "tool_call_id": "call-1"},
-            {"role": "assistant", "content": "Done."},
+        batch_body = [
+            {"tool_call_id": "call-2", "tool_name": "safe_action", "arguments": {"value": "two"}},
+            {"tool_call_id": "call-3", "tool_name": "safe_action", "arguments": {"value": "three"}},
         ]
+        batch = client.post("/runtime/tool_calls", json=batch_body)
+
+    assert single.content == b"plain safety payload"
+    assert single.text == "plain safety payload"
+    assert single.headers["content-type"].startswith("text/plain")
+    assert batch.json() == ["first", "second"]
+    runtime.simulate_tool_call.assert_awaited_once_with(
+        "safe_action",
+        {"value": "one"},
+        tool_call_id="call-1",
+    )
+    runtime.simulate_tool_calls.assert_awaited_once_with(batch_body)
+
+
+def test_plain_text_tool_payload_completes_lifecycle_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tools=True)
+    runtime.simulate_tool_call = AsyncMock(return_value="plain safety payload")
+    activation = SimpleNamespace(
+        to_dict=lambda: {
+            "activation_id": "activation-1",
+            "role": "assistant",
+            "model_alias": "assistant_model",
+            "messages": [{"role": "user", "content": "Do the task."}],
+            "parameters": {},
+            "assistant_tool_loop_policy": _descriptor(tools=True).to_dict()["loop_policy"],
+        }
+    )
+    complete = SimpleNamespace(
+        to_dict=lambda: {
+            "complete": True,
+            "result": {
+                "conversation_messages": [
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                    {"role": "tool", "content": "plain safety payload", "tool_call_id": "call-1"},
+                    {"role": "assistant", "content": "Done."},
+                ],
+                "conversation_status": True,
+                "simulation_outcome": {"status": "ok"},
+            },
+        }
+    )
+    runtime.advance = AsyncMock(side_effect=[activation, complete])
+    monkeypatch.setattr(UserSimResourcesServer, "_create_probe_runtime", lambda *_args, **_kwargs: runtime)
+
+    with TestClient(_app().setup_webserver()) as client:
+        client.post("/seed_session", json=_seed_body())
+        started = client.post("/runtime/start", json={})
+        tool = client.post(
+            "/safe_action",
+            json={},
+            headers={"X-NeMo-Gym-Tool-Call-Id": "call-1"},
+        )
         completed = client.post(
             "/runtime/advance",
             json={
-                "activation_id": activation.json()["activation_id"],
-                "transcript_delta": transcript,
+                "activation_id": started.json()["activation_id"],
+                "transcript_delta": [
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+                    {"role": "tool", "content": tool.text, "tool_call_id": "call-1"},
+                    {"role": "assistant", "content": "Done."},
+                ],
             },
         )
-        verify_body = _verify_body(seed.json())
-        verify_body["verification_input"]["usersim_result"] = completed.json()["result"]
-        verified = client.post("/verify", json=verify_body)
 
-    assert seed.status_code == 200
-    assert activation.status_code == 200
-    assert activation.json()["role"] == "assistant"
-    assert result.status_code == 200
     assert completed.status_code == 200
     assert completed.json()["complete"] is True
-    assert isinstance(result.json(), dict)
-    assert verified.status_code == 200
-    assert verified.json()["native_usersim_result"]["num_tool_calls"] == 1
-    assert verified.json()["verifier_data"]["native_scores"] is not None
+    runtime.simulate_tool_call.assert_awaited_once()
+    assert runtime.advance.await_count == 2
 
 
-def test_runtime_advance_is_action_idempotent_and_rejects_conflicts(tmp_path: Path) -> None:
-    pytest.importorskip("usersim.engine.core.episode_runtime")
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        client.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=42, probe_type="safety_agentic"),
-        )
-        activation = client.post("/runtime/start", json={}).json()
-        wrong_action = client.post(
-            "/runtime/advance",
-            json={
-                "activation_id": "activation-wrong",
-                "response": {"role": "assistant", "content": "wrong"},
-            },
-        )
-        result = {
-            "activation_id": activation["activation_id"],
-            "response": {"role": "assistant", "content": "I cannot perform that action."},
-        }
-        completed = client.post("/runtime/advance", json=result)
-        replayed = client.post("/runtime/advance", json=result)
-        conflict = client.post(
-            "/runtime/advance",
-            json={
-                "activation_id": activation["activation_id"],
-                "response": {"role": "assistant", "content": "changed"},
-            },
-        )
+def test_close_session_cancels_owned_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = _runtime()
+    lifecycle_task = MagicMock()
+    lifecycle_task.done.return_value = True
+    runtime._lifecycle_task = lifecycle_task
+    monkeypatch.setattr(UserSimResourcesServer, "_create_probe_runtime", lambda *_args, **_kwargs: runtime)
 
-    assert wrong_action.status_code == 409
-    assert "is not the pending activation" in wrong_action.json()["detail"]
-    assert completed.status_code == 200
-    assert completed.json()["complete"] is True
-    assert replayed.json() == completed.json()
-    assert conflict.status_code == 409
-    assert "different result" in conflict.json()["detail"]
-
-
-def test_startup_loads_prepared_panel_and_validates_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _write_personas(tmp_path)
-    _app(tmp_path)
-
-    monkeypatch.setattr(
-        "resources_servers.usersim.app._sha256_file",
-        lambda *_args, **_kwargs: "a" * 64,
-    )
-    with pytest.raises(RuntimeError, match="does not match its manifest"):
-        _app(tmp_path)
-
-
-def test_missing_pinned_dataset_fails_during_initialization(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError, match="gym eval prepare --config environments/usersim/config.yaml"):
-        _app(tmp_path)
-
-
-def test_seed_session_rejects_locale_not_initialized_at_startup(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    body = _seed_body(cache_dir=tmp_path, seed=7)
-    body["task_data"]["scenario"]["locale"] = "pt_BR"
-    body["task_data"]["usersim_context"]["locale"] = "pt_BR"
-    with TestClient(_app(tmp_path)) as client:
-        response = client.post("/seed_session", json=body)
-
-    assert response.status_code == 422
-    assert "was not initialized" in response.json()["detail"]
-
-
-def test_seed_session_rejects_task_from_different_prepared_panel(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    body = _seed_body(cache_dir=tmp_path, seed=7)
-    body["task_data"]["usersim_context"]["personas_panel_sha256"] = "a" * 64
-    with TestClient(_app(tmp_path)) as client:
-        response = client.post("/seed_session", json=body)
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == "Resolved UserSim task uses a different persona panel checksum"
-
-
-def test_verify_records_context_and_requires_both_participants(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        seed_result = client.post("/seed_session", json=_seed_body(cache_dir=tmp_path, seed=7)).json()
-        verified = client.post("/verify", json=_verify_body(seed_result)).json()
-        incomplete_body = _verify_body(seed_result)
-        incomplete_body["verification_input"]["usersim_result"]["conversation_messages"] = [
-            {"role": "user", "content": "Teach me about local ecology."}
-        ]
-        incomplete = client.post("/verify", json=incomplete_body).json()
-
-    assert verified["reward"] == 1.0
-    assert verified["scenario_completed"] is True
-    assert verified["verifier_data"]["usersim_context"]["seed"] == 7
-    assert incomplete["reward"] == 0.0
-    assert incomplete["scenario_completed"] is False
-
-
-def test_verify_uses_usersim_assistant_quality_as_reward(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    evaluator = pytest.importorskip("usersim.engine.evaluator.runtime")
-
-    async def evaluate_quality(*_args, **_kwargs):
-        return {
-            "envelope": {"axes": ["helpfulness", "accuracy", "coherence", "safety"]},
-            "axes": {
-                "helpfulness": {"judge_model": {"score": 5, "reasoning": "Helpful."}},
-                "accuracy": {"judge_model": {"score": 4, "reasoning": "Accurate."}},
-                "coherence": {"judge_model": {"score": 3, "reasoning": "Coherent."}},
-                "safety": {"judge_model": {"score": 5, "reasoning": "Safe."}},
-            },
-            "scorers": {},
-            "skipped": False,
-            "skipped_reason": None,
-        }
-
-    monkeypatch.setattr(UserSimResourcesServer, "_evaluate_assistant_quality", _ORIGINAL_EVALUATE_ASSISTANT_QUALITY)
-    monkeypatch.setattr(evaluator.TrajectoryEvaluatorRuntime, "evaluate", evaluate_quality)
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path, with_probe_scorer_model=True)) as client:
-        seed = client.post("/seed_session", json=_seed_body(cache_dir=tmp_path, seed=7)).json()
-        verified = client.post("/verify", json=_verify_body(seed)).json()
-
-    assert verified["reward"] == pytest.approx(0.8)
-    assert verified["reward_components"]["assistant_quality"] == pytest.approx(0.8)
-    assert verified["reward_components"]["quality.helpfulness"] == 1.0
-    assert verified["reward_components"]["quality.accuracy"] == 0.8
-    assert verified["reward_components"]["quality.coherence"] == 0.6
-    assert verified["verifier_data"]["assistant_eval"]["skipped"] is False
-    assert verified["verifier_data"]["normalized_axis_scores"]["safety"] == 1.0
-
-
-@pytest.mark.parametrize(
-    ("status_proposal", "error", "expected_reward"),
-    [(True, None, 1.0), (False, None, 0.0), (True, "judge failed", 0.0)],
-)
-def test_verify_applies_native_scorer_to_non_tool_probe(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    status_proposal: bool,
-    error: str | None,
-    expected_reward: float,
-) -> None:
-    scorers = pytest.importorskip("usersim.engine.evaluator.scorers")
-    calls: list[tuple[str, dict, dict]] = []
-
-    def fake_get_scorer(name: str):
-        async def score(trajectory: dict, models: dict) -> dict:
-            calls.append((name, trajectory, models))
-            return {"status_proposal": status_proposal, "error": error}
-
-        return score
-
-    monkeypatch.setattr(scorers, "get_scorer", fake_get_scorer)
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        seed = client.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=7, probe_type="safety_chat_pressure"),
-        ).json()
-        verified = client.post("/verify", json=_verify_body(seed)).json()
-
-    assert calls[0][0] == "safety_chat_pressure"
-    assert calls[0][1]["probe_type"] == "safety_chat_pressure"
-    assert calls[0][2] == {}
-    assert verified["reward"] == expected_reward
-    assert verified["reward_components"]["native_scorer_applied"] == 1.0
-    assert verified["verifier_data"]["native_scorer_name"] == "safety_chat_pressure"
-    assert verified["verifier_data"]["native_scores"]["error"] == error
-    assert verified["mask_sample"] is (error is not None)
-
-
-def test_verify_skips_concealment_scorer_for_default_health_variant(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scorers = pytest.importorskip("usersim.engine.evaluator.scorers")
-    monkeypatch.setattr(
-        scorers,
-        "get_scorer",
-        lambda _name: pytest.fail("default health variant has no concealment ground truth"),
-    )
-    _write_personas(tmp_path)
-    seed_body = _seed_body(cache_dir=tmp_path, seed=7, probe_type="health_general_disclosure")
-    seed_body["task_data"]["scenario"]["probe_data"] = {"probe_variant": "default"}
-    with TestClient(_app(tmp_path)) as client:
-        seed = client.post("/seed_session", json=seed_body).json()
-        verified = client.post("/verify", json=_verify_body(seed)).json()
-
-    assert verified["reward"] == 1.0
-    assert verified["reward_components"]["native_scorer_applied"] == 0.0
-    assert verified["verifier_data"]["native_scorer_name"] is None
-    assert verified["verifier_data"]["native_scores"] is None
-
-
-def test_verify_translates_native_scorer_exception_to_failed_evidence(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scorers = pytest.importorskip("usersim.engine.evaluator.scorers")
-
-    def fake_get_scorer(_name: str):
-        async def score(_trajectory: dict, _models: dict) -> dict:
-            raise RuntimeError("scorer unavailable")
-
-        return score
-
-    monkeypatch.setattr(scorers, "get_scorer", fake_get_scorer)
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        seed = client.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=7, probe_type="sov_ai_facts"),
-        ).json()
-        verified = client.post("/verify", json=_verify_body(seed)).json()
-
-    assert verified["reward"] == 0.0
-    assert verified["verifier_data"]["native_scores"] == {
-        "status_proposal": False,
-        "error": "RuntimeError: scorer unavailable",
-    }
-    assert verified["mask_sample"] is True
-    assert verified["failure_kind"] == "judge_failed"
-
-
-def test_verify_rejects_context_from_another_seeded_episode(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        seed_result = client.post("/seed_session", json=_seed_body(cache_dir=tmp_path, seed=7)).json()
-        verify_body = _verify_body(seed_result)
-        verify_body["verification_input"]["usersim_context"]["seed"] = 8
-        response = client.post("/verify", json=verify_body)
-
-    assert response.status_code == 409
-    assert response.json()["detail"] == "Verified NeMo UserSim resolved episode does not match the seeded session"
-
-
-def test_seed_session_rejects_non_sampling_task_fields(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    body = _seed_body(cache_dir=tmp_path, seed=7)
-    body["task_data"]["responses_create_params"] = {"input": []}
-    with TestClient(_app(tmp_path)) as client:
-        response = client.post("/seed_session", json=body)
-
-    assert response.status_code == 422
-
-
-def test_close_session_releases_seeded_state(tmp_path: Path) -> None:
-    _write_personas(tmp_path)
-    with TestClient(_app(tmp_path)) as client:
-        seed = client.post(
-            "/seed_session",
-            json=_seed_body(cache_dir=tmp_path, seed=7, probe_type="safety_agentic"),
-        ).json()
-        activation = client.post("/runtime/start", json={}).json()
+    with TestClient(_app().setup_webserver()) as client:
+        seed = client.post("/seed_session", json=_seed_body()).json()
         closed = client.post(
             "/close_session",
             json={
@@ -770,15 +241,44 @@ def test_close_session_releases_seeded_state(tmp_path: Path) -> None:
                 "episode_id": {"rollout_id": "0-0", "attempt": 0},
             },
         )
-        with pytest.raises(RuntimeError, match="No active NeMo UserSim scenario"):
-            client.post("/verify", json=_verify_body(seed))
-        with pytest.raises(RuntimeError, match="No active NeMo UserSim scenario"):
-            client.post(
-                "/runtime/advance",
-                json={
-                    "activation_id": activation["activation_id"],
-                    "response": {"role": "assistant", "content": "late"},
-                },
-            )
 
     assert closed.status_code == 200
+
+
+def test_native_runtime_assigns_semantic_indices_for_ordered_parallel_calls() -> None:
+    from usersim.engine.external import ProbeEpisodeRuntime
+
+    runtime = ProbeEpisodeRuntime(
+        probe_type="safety_agentic",
+        persona={
+            "first_name": "Morgan",
+            "last_name": "Lee",
+            "age": 42,
+            "city": "Seattle",
+            "education_level": "Bachelor",
+            "occupation": "Engineer",
+        },
+        locale="en_US",
+        language="English",
+        models={},
+        config=SimpleNamespace(random_seed=42, max_turns=3),
+        data={"user_interaction_style": "direct"},
+        profile={"patience": 0.75},
+    )
+    tool_name = next(iter(runtime.allowed_tool_names))
+    calls = [
+        {"tool_call_id": "call-1", "tool_name": tool_name, "arguments": {"value": "first"}},
+        {"tool_call_id": "call-2", "tool_name": tool_name, "arguments": {"value": "second"}},
+    ]
+
+    async def run_calls() -> dict:
+        await runtime.simulate_tool_calls(calls)
+        return await runtime.evidence()
+
+    import asyncio
+
+    evidence = asyncio.run(run_calls())
+    actions = evidence["conversation_metadata"]["attempted_actions"]
+    traces = evidence["simulation_traces"]
+    assert [action["turn_idx"] for action in actions] == [0, 0]
+    assert [(trace["turn_idx"], trace["call_idx"]) for trace in traces] == [(0, 0), (0, 1)]

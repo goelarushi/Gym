@@ -373,8 +373,7 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
                     episode_id=request.episode_id,
                     task_id=request.task.task_id,
                     verification_input=UserSimVerificationInput(
-                        scenario=seed.scenario,
-                        usersim_context=seed.usersim_context,
+                        resolved_row=seed.resolved_row,
                         usersim_result=result,
                         invocations=bridge.invocations,
                     ),
@@ -448,6 +447,7 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
                     required=True,
                     base_url=resources_base_url,
                     cookies=resources_cookies,
+                    batch_path="/runtime/tool_calls",
                 )
             )
         if "mcp" in self.config.resources_tool_transports:

@@ -21,66 +21,15 @@ UserSimAgentRole = Literal["user", "assistant", "judge", "summary"]
 USERSIM_EPISODE_PROTOCOL = "usersim.ConversationLoop"
 
 
-class UserSimScenario(BaseModel):
-    """One fully resolved UserSim scenario."""
-
-    model_config = ConfigDict(extra="allow")
-
-    persona: dict[str, Any]
-    probe_type: str = "general_open_ended"
-    theme: dict[str, Any] | str
-    goal: str = ""
-    locale: str = "en_US"
-    probe_data: dict[str, Any] = Field(default_factory=dict)
-
-
-class UserSimProtocolConfig(BaseModel):
-    """Run-wide ``ConversationSimulatorConfig`` behavior owned by Gym."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    max_tools: int = Field(5, ge=1)
-    max_steps: int = Field(10, ge=1)
-    max_query_attempts: int = Field(3, ge=1)
-    max_assistant_attempts: int = Field(1, ge=1)
-    enforce_user_language: bool = True
-    user_language_min_script_compliance: float = Field(0.6, ge=0, le=1)
-    user_language_min_letters: int = Field(8, ge=0)
-    incremental_disclosure_ratio: float = Field(0.6, ge=0, le=1)
-    persona_grounding_ratio: float = Field(1, ge=0, le=1)
-    context_compression: bool = False
-    compression_window: int = Field(1, ge=1)
-    store_reasoning: bool = True
-    finance_tier_mix: float = Field(0.0, ge=0, le=1)
-    finance_tier: Literal["verifiable", "dynamic"] | None = None
-    finance_retrieval_mode: Literal["hybrid", "dense", "golden"] = "hybrid"
-    finance_embedding_model_alias: str = "embedding_model"
-    random_seed: int | None = None
-    verbosity: int = Field(1, ge=0, le=2)
-
-
 class UserSimTaskInput(BaseModel):
     """Fully resolved, provenance-pinned input loaded from one prepared task row."""
 
     model_config = ConfigDict(extra="forbid")
 
-    scenario: UserSimScenario
-    usersim_context: "ResolvedUserSimContext"
+    resolved_row: dict[str, Any]
     responses_create_params: dict[UserSimAgentRole, NeMoGymResponseCreateParamsNonStreaming] = Field(
         default_factory=dict
     )
-
-
-class ResolvedUserSimContext(BaseModel):
-    """Selection provenance required to replay a resolved scenario."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    locale: str
-    seed: int
-    personas_dataset_version: str
-    personas_panel_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    usersim_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 
 class AssistantToolLoopPolicy(BaseModel):
@@ -131,10 +80,9 @@ class ProbeRuntimeDescriptor(BaseModel):
 
 
 class UserSimSeedResponse(ResourcesSeedSessionResponse):
-    """Return resources-session identity plus the resolved scenario."""
+    """Return resources-session identity plus the unchanged resolved row."""
 
-    scenario: UserSimScenario
-    usersim_context: ResolvedUserSimContext
+    resolved_row: dict[str, Any]
     assistant_tools: list[dict[str, Any]] = Field(default_factory=list)
     runtime_descriptor: ProbeRuntimeDescriptor | None = None
 
@@ -222,8 +170,7 @@ class UserSimVerificationInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    scenario: UserSimScenario
-    usersim_context: ResolvedUserSimContext
+    resolved_row: dict[str, Any]
     usersim_result: UserSimSimulationResult
     invocations: list[UserSimInvocation]
     episode_interaction_protocol: str = USERSIM_EPISODE_PROTOCOL

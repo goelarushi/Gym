@@ -504,8 +504,8 @@ class TestApp:
         async def post(*, server_name, url_path, **kwargs):
             if server_name == "model":
                 return _mock_response(next(model_payloads))
-            assert (server_name, url_path) == ("resources", "/lookup")
-            resource_response = _mock_response(content='{"value":"ok"}')
+            assert (server_name, url_path) == ("resources", "/runtime/tool_calls")
+            resource_response = _mock_response(payload=["first opaque payload", "second opaque payload"])
             cookie = MagicMock()
             cookie.value = "updated-cookie"
             resource_response.cookies = {"resources-session": cookie}
@@ -529,7 +529,7 @@ class TestApp:
             resources_server_cookies={},
             collect_trajectory=True,
             invocation_id="activation-4",
-            activation_idx=4,
+            tool_batch_path="/runtime/tool_calls",
             tool_loop_policy=AgentToolLoopPolicy(
                 tool_round_mode="single",
                 max_assistant_activations=2,
@@ -550,19 +550,17 @@ class TestApp:
             "function_call_output",
             "message",
         ]
-        tool_call = server_client.post.await_args_list[1]
-        assert tool_call.kwargs["headers"] == {
-            "X-NeMo-Gym-Tool-Call-Id": "call-7",
-            "X-NeMo-Gym-Turn-Index": "4",
-            "X-NeMo-Gym-Call-Index": "0",
-        }
-        second_tool_call = server_client.post.await_args_list[2]
-        assert second_tool_call.kwargs["headers"] == {
-            "X-NeMo-Gym-Tool-Call-Id": "call-8",
-            "X-NeMo-Gym-Turn-Index": "4",
-            "X-NeMo-Gym-Call-Index": "1",
-        }
-        final_request = server_client.post.await_args_list[3].kwargs["json"]
+        batch_call = server_client.post.await_args_list[1]
+        assert batch_call.kwargs["json"] == [
+            {"tool_call_id": "call-7", "tool_name": "lookup", "arguments": {"query": "x"}},
+            {"tool_call_id": "call-8", "tool_name": "lookup", "arguments": {"query": "ignored"}},
+        ]
+        assert "headers" not in batch_call.kwargs
+        assert [item.output for item in response.output if item.type == "function_call_output"] == [
+            "first opaque payload",
+            "second opaque payload",
+        ]
+        final_request = server_client.post.await_args_list[2].kwargs["json"]
         assert final_request.tools == []
         assert resource_cookies == {"resources-session": "updated-cookie"}
 

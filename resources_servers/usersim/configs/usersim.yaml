@@ -33,18 +33,14 @@ usersim_resources:
       entrypoint: app.py
       domain: agent
       verified: false
-      description: Deterministic NeMo UserSim persona, probe runtime, and verification.
-      personas_cache_dir: ~/.cache/nemo-gym/usersim/personas
-      personas_dataset_version: 0.0.2
-      usersim_revision: 2d9ec0d7c32ac800f2171b5943382a7b1eb96cbc  # pragma: allowlist secret
+      description: Canonical NeMo UserSim probe runtime and verification.
+      usersim_revision: 4fd4c800bbef8883329543df632f328860fc6429  # pragma: allowlist secret
       tool_simulation_model:
         type: responses_api_models
         name: support_model
       probe_scorer_model:
         type: responses_api_models
         name: support_model
-      personas_locales:
-      - en_US
       datasets:
         - name: example
           type: example

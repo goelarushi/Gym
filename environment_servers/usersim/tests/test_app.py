@@ -285,19 +285,18 @@ def _request() -> UserSimEpisodeRequest:
         task=MaterializedTask(
             task_id=TaskId(taskset="usersim:example", task_id="task"),
             task_input=UserSimTaskInput(
-                scenario={
+                resolved_row={
                     "persona": {"first_name": "Morgan"},
                     "probe_type": "general_open_ended",
+                    "probe_family": "general_open_ended",
+                    "probe_variant": "default",
                     "theme": {"type": "recommendation", "description": "Plan dinner."},
-                    "goal": "Plan dinner.",
                     "locale": "en_US",
-                },
-                usersim_context={
-                    "locale": "en_US",
-                    "seed": 42,
-                    "personas_dataset_version": "0.0.2",
-                    "personas_panel_sha256": "a" * 64,
-                    "usersim_revision": "b" * 40,
+                    "trajectory_id": "native-trajectory",
+                    "usersim_provenance": {
+                        "code_sha": "4fd4c800bbef8883329543df632f328860fc6429",
+                    },
+                    "usersim_config": {"random_seed": 42},
                 },
                 responses_create_params={
                     "user": {"input": [], "temperature": 0.8},
@@ -316,19 +315,18 @@ def _queue_success_responses(client: _Client) -> None:
             _Response(
                 {
                     "resources_session_id": "resources-session",
-                    "scenario": {
+                    "resolved_row": {
                         "persona": {"first_name": "Morgan"},
                         "probe_type": "general_open_ended",
+                        "probe_family": "general_open_ended",
+                        "probe_variant": "default",
                         "theme": {"type": "recommendation", "description": "Plan dinner."},
-                        "goal": "Plan dinner.",
                         "locale": "en_US",
-                    },
-                    "usersim_context": {
-                        "locale": "en_US",
-                        "seed": 42,
-                        "personas_dataset_version": "0.0.2",
-                        "personas_panel_sha256": "a" * 64,
-                        "usersim_revision": "b" * 40,
+                        "trajectory_id": "native-trajectory",
+                        "usersim_provenance": {
+                            "code_sha": "4fd4c800bbef8883329543df632f328860fc6429",
+                        },
+                        "usersim_config": {"random_seed": 42},
                     },
                     "assistant_tools": _runtime_descriptor().assistant_tools,
                     "runtime_descriptor": _runtime_descriptor().model_dump(mode="json"),
@@ -527,14 +525,17 @@ async def test_usersim_environment_server_runs_native_episode() -> None:
     [tool_access] = client.calls[2][2]["json"]["tool_accesses"]
     assert tool_access["name"] == "resources.direct_http"
     assert tool_access["cookies"] == {"session": "resources-cookie"}
+    assert tool_access["batch_path"] == "/runtime/tool_calls"
     assert client.calls[4][2]["cookies"] == {"session": "user-cookie"}
     assert client.calls[6][2]["cookies"] == {"session": "assistant-cookie"}
     assert client.calls[8][0] == "support"
     assert client.calls[10][0] == "support"
     assert "cookies" not in client.calls[8][2]
     assert "cookies" not in client.calls[10][2]
+    assert client.calls[0][2]["json"].task_data == _request().task.task_input.model_dump(mode="json")
     verify_body = client.calls[14][2]["json"]
     assert verify_body.task_id == TaskId(taskset="usersim:example", task_id="task")
+    assert verify_body.verification_input.resolved_row["trajectory_id"] == "native-trajectory"
     assert [invocation.role for invocation in verify_body.verification_input.invocations] == [
         "user",
         "assistant",

@@ -19,6 +19,7 @@ class DirectHTTPToolAccess(BaseModel):
     base_url: AnyHttpUrl
     cookies: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+    batch_path: str | None = Field(default=None, pattern=r"^/")
 
 
 class MCPStreamableHTTPConnection(BaseModel):
