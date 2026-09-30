@@ -41,16 +41,21 @@ from nemo_gym.exporters import export_metrics, export_rollouts, get_exporters
 from nemo_gym.global_config import (
     AGENT_REF_KEY_NAME,
     ATTEMPT_INDEX_KEY_NAME,
+    ENVIRONMENT_SERVER_STAMP_KEY_NAME,
     ROLLOUT_ID_KEY_NAME,
     ROLLOUT_INDEX_KEY_NAME,
     SKILLS_REF_KEY_NAME,
     TASK_INDEX_KEY_NAME,
     TASK_SOURCE_KEY_NAME,
+    rollout_agent_label,
+    rollout_run_key,
+    rollout_run_labels,
 )
 from nemo_gym.path_utils import aggregate_metrics_path_for, failures_path_for
 from nemo_gym.rollout_collection import (
     NG_FAILURE_CLASS_KEY,
     NG_NO_PERSIST_KEY,
+    NG_RESULT_TYPE_KEY,
     NG_TERMINAL_KEY,
     _coverage_report,
     _get_max_rollout_attempts,
@@ -275,6 +280,13 @@ def _rs_for_row(
         block = global_config_dict.get(ts)
         if isinstance(block, (dict, DictConfig)) and "resources_servers" in block:
             return str(ts)
+    server = row.get(ENVIRONMENT_SERVER_STAMP_KEY_NAME)
+    server_block = global_config_dict.get(server) if isinstance(server, str) else None
+    if isinstance(server_block, (dict, DictConfig)):
+        for environment_server in (server_block.get("environment_servers") or {}).values():
+            resources_ref = environment_server.get("resources_server") if environment_server else None
+            if resources_ref and resources_ref.get("name"):
+                return str(resources_ref["name"])
     agent_name = (row.get(AGENT_REF_KEY_NAME) or {}).get("name")
     try:
         return agent_to_rs[agent_name]
@@ -342,11 +354,10 @@ def _response_has_function_calls(row: Dict[str, Any]) -> bool:
 # Function used to summarize the debug information for a failed verification
 # ---------------------------------------------------------------------------
 def _rollout_verify_debug_summary(row: Dict[str, Any], resources_server_name: str) -> Dict[str, Any]:
-    agent_ref = row.get(AGENT_REF_KEY_NAME) or {}
     summary = {
         TASK_INDEX_KEY_NAME: row.get(TASK_INDEX_KEY_NAME),
         ROLLOUT_INDEX_KEY_NAME: row.get(ROLLOUT_INDEX_KEY_NAME),
-        "agent_name": agent_ref.get("name") if isinstance(agent_ref, dict) else None,
+        "agent_name": rollout_agent_label(row),
         "resources_server_name": resources_server_name,
     }
     return {k: v for k, v in summary.items() if v is not None}
@@ -544,13 +555,40 @@ def _yield_inputs_and_rollouts_paired(
             n_yielded += 1
 
 
+def _rollout_response(rollout: Dict[str, Any]) -> Any:
+    """Return the response a rollout's verifier scored, or explain which result type lacks one."""
+    if "response" not in rollout:
+        result_type = rollout.get(NG_RESULT_TYPE_KEY, "unknown")
+        raise ConfigError(
+            f"reverify: rollout (task {rollout.get(TASK_INDEX_KEY_NAME)}, rollout {rollout.get(ROLLOUT_INDEX_KEY_NAME)}) "
+            f"of result type {result_type!r} has no `response`, which reverification needs"
+        )
+    return rollout["response"]
+
+
 def _build_verify_payload(pair: InputRolloutPair) -> Dict:
-    payload = pair.input | {"response": pair.rollout["response"]}
+    payload = pair.input | {"response": _rollout_response(pair.rollout)}
     # Judging reuses the generation; its canonical evidence must travel with it.
     # Do not copy stale rewards, failure flags, or other verifier-owned fields.
     if "ng_trajectory" in pair.rollout:
         payload["ng_trajectory"] = pair.rollout["ng_trajectory"]
+    for key in (NG_RESULT_TYPE_KEY, "_ng_task_id"):
+        if key in pair.rollout:
+            payload[key] = pair.rollout[key]
     return payload
+
+
+def _verification_request_body(row: Dict) -> Dict:
+    """Flatten native task input only at dispatch, after recovery validates its identity."""
+    request = {key: value for key, value in row.items() if key != ATIF_PROVENANCE_KEY}
+    task_input = request.get("task_input")
+    if not isinstance(task_input, dict):
+        return request
+    return (
+        (task_input.get("task_data") or {})
+        | {"responses_create_params": task_input.get("responses_create_params")}
+        | {key: value for key, value in request.items() if key not in ("task_id", "task_input")}
+    )
 
 
 def _prepare_payloads(
@@ -652,7 +690,7 @@ def _run_verification_payloads(
             rs_name = _rs_for_row(row, agent_to_rs, server_client.global_config_dict)
             if on_dispatch is not None:
                 on_dispatch(row)
-            request_row = {key: value for key, value in row.items() if key != ATIF_PROVENANCE_KEY}
+            request_row = _verification_request_body(row)
             res = await server_client.post(server_name=rs_name, url_path="/verify", json=request_row)
             try:
                 await raise_for_status(
@@ -793,10 +831,12 @@ async def _call_aggregate_metrics(
     # fallback). Routing aggregation independently by the agent's configured server allowed a
     # remapped row to be verified by one server and aggregated by another.
     agent_results: Dict[Tuple[str, str], List[Dict]] = {}
+    labels = rollout_run_labels(rows)
     for row, result in zip(rows, results):
-        agent_name = (row.get(AGENT_REF_KEY_NAME) or {}).get("name")
-        if not agent_name:
+        key = rollout_run_key(row)
+        if not key:
             continue
+        agent_name = labels[key]
         rs_name = _rs_for_row(row, agent_to_rs, server_client.global_config_dict)
         agent_results.setdefault((agent_name, rs_name), []).append(result)
 
@@ -917,7 +957,10 @@ def _load_reverified_results(output_fpath: Path) -> Tuple[List[Dict], List[Dict]
         with output_fpath.open("rb") as f:
             results = [orjson.loads(line) for line in f if line.strip()]
     results.sort(key=lambda r: (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]))
-    rows = [{k: r[k] for k in (AGENT_REF_KEY_NAME, TASK_SOURCE_KEY_NAME) if k in r} for r in results]
+    rows = [
+        {k: r[k] for k in (AGENT_REF_KEY_NAME, TASK_SOURCE_KEY_NAME, ENVIRONMENT_SERVER_STAMP_KEY_NAME) if k in r}
+        for r in results
+    ]
     return results, rows
 
 
@@ -1002,7 +1045,8 @@ class RolloutReverificationHelper(BaseModel):
             semaphore = Semaphore(config.num_samples_in_parallel)
 
         pcts_to_print = [20, 40, 60, 80, 90, 95, 98, 99, 100]
-        counts_left = Counter(r[AGENT_REF_KEY_NAME]["name"] for r in payloads_to_reverify)
+        run_labels = rollout_run_labels(payloads_to_reverify)
+        counts_left = Counter(run_labels.get(rollout_run_key(r)) for r in payloads_to_reverify)
         files = ExitStack()
         verification_tasks = []
         failure_counts: Counter = Counter()
@@ -1020,14 +1064,23 @@ class RolloutReverificationHelper(BaseModel):
 
                 result[TASK_INDEX_KEY_NAME] = row[TASK_INDEX_KEY_NAME]
                 result[ROLLOUT_INDEX_KEY_NAME] = row[ROLLOUT_INDEX_KEY_NAME]
-                result[AGENT_REF_KEY_NAME] = row[AGENT_REF_KEY_NAME]
+                for key in (AGENT_REF_KEY_NAME, ENVIRONMENT_SERVER_STAMP_KEY_NAME):
+                    if key in row:
+                        result[key] = row[key]
                 # Keep task_source alongside agent_ref: aggregation routes with the same resolver
                 # as /verify (task_source authoritative), so it must survive into the output file.
                 if TASK_SOURCE_KEY_NAME in row:
                     result[TASK_SOURCE_KEY_NAME] = row[TASK_SOURCE_KEY_NAME]
                 if SKILLS_REF_KEY_NAME in row:
                     result[SKILLS_REF_KEY_NAME] = row[SKILLS_REF_KEY_NAME]
-                for key in (ROLLOUT_ID_KEY_NAME, ATTEMPT_INDEX_KEY_NAME, RUN_ID_KEY, ATIF_PROVENANCE_KEY):
+                for key in (
+                    ROLLOUT_ID_KEY_NAME,
+                    ATTEMPT_INDEX_KEY_NAME,
+                    RUN_ID_KEY,
+                    ATIF_PROVENANCE_KEY,
+                    NG_RESULT_TYPE_KEY,
+                    "_ng_task_id",
+                ):
                     if key in row:
                         result[key] = row[key]
                 if "ng_trajectory" in row:
@@ -1080,9 +1133,10 @@ class RolloutReverificationHelper(BaseModel):
                         results_file.write(serialized + b"\n")
                         results_file.flush()
 
-                counts_left[row[AGENT_REF_KEY_NAME]["name"]] -= 1
-                if counts_left[row[AGENT_REF_KEY_NAME]["name"]] <= 0:
-                    counts_left.pop(row[AGENT_REF_KEY_NAME]["name"])
+                label = run_labels.get(rollout_run_key(row))
+                counts_left[label] -= 1
+                if counts_left[label] <= 0:
+                    counts_left.pop(label)
 
                 completed += 1
                 current_pct = 100 * completed / len(payloads_to_reverify)
@@ -1127,13 +1181,14 @@ class RolloutReverificationHelper(BaseModel):
         if store is not None:
             failure_counts = Counter(row[NG_FAILURE_CLASS_KEY] for row in store.failures())
         expected_rollouts = store.coverage()["expected"] if store else len(results) + sum(failure_counts.values())
-        coverage = _coverage_report(expected_rollouts, len(results), failure_counts, output_fpaths.failures)
+        scored_rollouts = sum(type(result.get("reward")) in (int, float) for result in results)
+        coverage = _coverage_report(expected_rollouts, scored_rollouts, failure_counts, output_fpaths.failures)
         if get_exporters():  # pragma: no cover
             export_metrics(
                 {
                     "coverage/expected": expected_rollouts,
-                    "coverage/scored": len(results),
-                    "coverage/missing": expected_rollouts - len(results),
+                    "coverage/scored": scored_rollouts,
+                    "coverage/missing": expected_rollouts - scored_rollouts,
                 }
             )
 

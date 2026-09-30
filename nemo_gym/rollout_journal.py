@@ -103,6 +103,7 @@ class _Outcome:
     failure_class: str | None
     terminal: bool
     masked: bool
+    has_reward: bool
 
 
 def _indexed_records(path: Path) -> Iterator[tuple[RolloutRecord, dict]]:
@@ -256,6 +257,7 @@ class RolloutJournal:
             failure_class=row.get("_ng_failure_class"),
             terminal=bool(row.get("_ng_failure_terminal")),
             masked=bool(row.get("mask_sample")),
+            has_reward=type(row.get("reward")) in (int, float),
         )
 
     def outcome(self, row: dict, *, record: RolloutRecord) -> None:
@@ -392,6 +394,12 @@ class RolloutJournal:
         # it. Report its measurement status separately, after selecting attempts.
         masked = sum(
             self.payloads[(identity, self.latest[identity])].masked
+            and self.payloads[(identity, self.latest[identity])].has_reward
+            for identity in self.expected
+            if self.disposition(identity) == "success"
+        )
+        unscored = sum(
+            not self.payloads[(identity, self.latest[identity])].has_reward
             for identity in self.expected
             if self.disposition(identity) == "success"
         )
@@ -401,8 +409,9 @@ class RolloutJournal:
             "run_id": self.manifest.run_id,
             "expected": expected,
             "successful": counts["success"],
-            "measured": counts["success"] - masked,
+            "measured": counts["success"] - masked - unscored,
             "masked": masked,
+            "unscored": unscored,
             "failed": counts["failure"],
             "intentionally_omitted": counts["omitted"],
             "unknown": counts["unknown"],

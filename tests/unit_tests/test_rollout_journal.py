@@ -538,6 +538,7 @@ async def test_offline_aggregation_uses_newest_attempt_and_full_inventory(
         "coverage/known": 1,
         "coverage/measured": int(not masked),
         "coverage/masked": int(masked),
+        "coverage/unscored": 0,
         "coverage/failed": 1,
         "coverage/omitted": 1,
         "coverage/unknown": 2,
@@ -616,6 +617,7 @@ async def test_legacy_aggregation_cannot_claim_complete_without_inventory(tmp_pa
             "coverage/known": 0,
             "coverage/measured": int(not masked),
             "coverage/masked": int(masked),
+            "coverage/unscored": 0,
         }
     ]
     assert "scores may be partial" in capsys.readouterr().out

@@ -26,8 +26,9 @@ recognized credential fields, endpoint addresses, or capture directories does no
 This includes the shipped policy/judge/provider API-key fields and authentication headers at known server settings
 boundaries. Other headers, custom configuration fields, and task parameters remain part of identity; custom integrations
 should not assume arbitrary credential names are automatically excluded. Gym resolves configuration
-for the materialized agents and their referenced servers; unused server configurations need not resolve in the collector.
-Changing a model, sampling settings, task data paths, prompts, or tasks does invalidate saved results.
+for the materialized agents, their selected Environment Servers, and referenced servers; unused server configurations need not resolve in the collector.
+Changing a model, sampling settings, task data paths, prompts, tasks, or Environment Server orchestration does invalidate saved results.
+Memory retention and resident-task limits can change on resume without changing task identity.
 
 Keep the manifest, materialized inputs, rollout output, failure sidecar, and attempt journal together.
 Gym records and flushes each dispatch to `<output_stem>_attempts.jsonl` before sending its request. Completed results and
@@ -39,6 +40,28 @@ Use one collector per output path. For parallel jobs, give each shard its own ou
 
 An infrastructure failure is eligible for another attempt according to the existing attempt limit and terminal markers.
 A completed wrong answer is a result, so it is not retried merely because its reward is zero.
+
+## Environment Server boundary
+
+An Environment Server owns one episode attempt: preparing resources, running the agent, verifying its answer,
+and cleaning up that attempt. The collector owns the saved run history and decides which logical rollouts need
+another attempt after a restart. Resume sends a new episode attempt through the same Environment Server;
+it does not restore in-memory environment state or guarantee that cleanup ran after a hard process kill.
+
+For example, if two of three episodes finish and the third reports a retryable setup failure, resume keeps the
+first two results and sends only the third task again with a larger attempt index. A terminal failure is recorded
+but not retried. Native episode replies must match the dispatched task and attempt identities.
+
+Native Environment Servers may return completed results without a `reward` or model `response`. Such results
+remain saved and reusable; no zero reward is invented. Results without a numeric reward are reported as `unscored`.
+`require_complete` checks completed episodes, so an unscored completion satisfies that check without becoming a score.
+
+Native episode failures are recorded as `environment_server_failed`, preserving the terminal flag, stage, and any
+partial response as diagnostics. They are eligible for whole-episode retry when nonterminal. The current
+`--judge-failed-only` path selects `judge_failed` records with a saved `response`; it does not yet convert native
+verification-stage failures or their `partial_response` into judge-only inputs. The native judge-failure contract is
+tracked in [#3815](https://github.com/NVIDIA-NeMo/Gym/issues/3815). A custom environment result must not contain
+collector-reserved `_ng_*` fields, even when reporting a judge failure.
 
 ## Attempts and completion coverage
 
@@ -73,8 +96,9 @@ Gym writes `<output_stem>_coverage.json` with an exact inventory:
 | --- | --- |
 | `expected` | Number of logical rollouts in the materialized inputs. |
 | `successful` | Rollouts with a completed result, including wrong answers and completed masked results. |
-| `measured` | Completed results whose producer did not set `mask_sample`, including valid reward-zero results. |
-| `masked` | Completed results whose producer set `mask_sample`. These remain saved and reusable on resume. |
+| `measured` | Completed results with a numeric reward whose producer did not set `mask_sample`, including valid reward-zero results. |
+| `masked` | Completed results with a numeric reward whose producer set `mask_sample`. These remain saved and reusable on resume. |
+| `unscored` | Completed results without a numeric reward, including those also marked `mask_sample`. |
 | `failed` | Rollouts whose selected attempt reported a no-result failure. |
 | `intentionally_omitted` | Explicit producer omissions, including terminal `skipped` outcomes. |
 | `unknown` | Rollouts with no saved outcome, including work never dispatched. |
@@ -82,8 +106,8 @@ Gym writes `<output_stem>_coverage.json` with an exact inventory:
 The existing `successful` field remains the completed-result total. The measurement split is additive:
 
 ```text
-successful = measured + masked
-expected = measured + masked + failed + intentionally_omitted + unknown
+successful = measured + masked + unscored
+expected = measured + masked + unscored + failed + intentionally_omitted + unknown
 ```
 
 Counts describe the selected attempt for each logical rollout. Older attempts cannot count again or change whether
@@ -93,13 +117,13 @@ the selected result is masked. Failure metadata on a completed result does not b
 A fully masked run can be complete while containing no unmasked measurements. Masking alone does not trigger recovery.
 Completed-result quality scoring follows the verifier/aggregation contract; these counts describe collection coverage.
 
-`scored` retains its existing meaning: the number of completed results, plus failures explicitly counted as zero when
-aggregating. It is separate from the measurement split. Setting `count_failure_classes_as_zero` does not change a failure into
-a measured or completed result and cannot make the five outcome counts exceed `expected`.
+`scored` counts completed results with a numeric reward, plus failures explicitly counted as zero when
+aggregating. Unscored completions do not enter this count. It is separate from the measurement split. Setting `count_failure_classes_as_zero` does not change a failure into
+a measured or completed result and cannot make the outcome counts exceed `expected`.
 An explicit `skipped` entry in `count_failure_classes_as_zero` includes terminal skipped payloads in scoring while their
 completion disposition remains intentionally omitted. Omissions without a failure payload cannot be scored this way.
 
-Collection and offline aggregation export the same counts as `coverage/measured`, `coverage/masked`, `coverage/failed`,
+Collection and offline aggregation export the same counts as `coverage/measured`, `coverage/masked`, `coverage/unscored`, `coverage/failed`,
 `coverage/omitted`, and `coverage/unknown`. For legacy shards without a manifest or journal, observed measured/masked counts remain
 available, while expected, omitted, and unknown totals remain unknown.
 
@@ -163,7 +187,7 @@ async def collect_outcomes(input_rows):
         if isinstance(outcome, RolloutFailure):
             print(outcome.attempt_id, outcome.failure_kind, outcome.failure_reason)
         else:
-            print(outcome["reward"])
+            print(outcome.get("reward", "Completed without a score"))
 ```
 
 Configure and start the referenced Gym servers before calling the helper. Callers supplying explicit rollout IDs can skip

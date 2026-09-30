@@ -34,7 +34,9 @@ class RolloutFailure(BaseModel):
     run_id: str | None = None
     attempt_index: int = Field(default=0, ge=0, strict=True)
     failure_kind: str = Field(min_length=1)
-    stage: Literal["request", "response", "result", "agent", "verifier"]
+    stage: Literal[
+        "request", "response", "result", "agent", "verifier", "environment", "seed", "verification", "cleanup"
+    ]
     failure_reason: str
     exception_type: str | None = None
     http_status: int | None = None

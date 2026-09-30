@@ -43,6 +43,9 @@ _COLLECTION_OPTIONS = frozenset(
         "output_jsonl_fpath",
         "input_jsonl_fpath",
         "num_samples_in_parallel",
+        "max_resident_rollout_tasks",
+        "retain_results_in_memory",
+        "require_complete",
         "disable_aggregation",
         "disable_health_check",
         "health_check_workers",
@@ -83,7 +86,7 @@ _SERVER_RUNTIME_OPTIONS = frozenset(
         "model_call_capture_dir",
     }
 )
-_SERVER_KINDS = ("responses_api_agents", "responses_api_models", "resources_servers")
+_SERVER_KINDS = ("responses_api_agents", "responses_api_models", "resources_servers", "environment_servers")
 
 
 _DEFAULT_MAX_ROLLOUT_ATTEMPTS = 3
@@ -174,6 +177,14 @@ def _configuration_identity(config: dict, global_config: dict, rows: list[dict])
         name for name, block in raw.items() if isinstance(block, dict) and any(k in block for k in _SERVER_KINDS)
     }
     pending = {row.get("agent_ref", {}).get("name") for row in rows} - {None}
+    pending.update(row["_ng_environment_server"] for row in rows if row.get("_ng_environment_server"))
+    # Agent-routed legacy rows are wrapped by an Environment Server at dispatch.
+    # Its orchestration settings are part of the task even without a row stamp.
+    agents = {row.get("agent_ref", {}).get("name") for row in rows if not row.get("_ng_environment_server")} - {None}
+    for name in servers:
+        for settings in raw[name].get("environment_servers", {}).values():
+            if isinstance(settings, dict) and (settings.get("agent_server") or {}).get("name") in agents:
+                pending.add(name)
     pending.update(row["task_source"] for row in rows if isinstance(row.get("task_source"), str))
     if not pending:
         pending = set(servers)

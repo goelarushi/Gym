@@ -423,6 +423,240 @@ def runner_config(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("retain_results", [False, True])
+@pytest.mark.parametrize("masked_unscored", [False, True])
+async def test_native_recovery_preserves_terminal_failures_and_unscored_completion(
+    tmp_path, monkeypatch, retain_results, masked_unscored
+):
+    from nemo_gym.rollout_store import RolloutStore
+
+    source = tmp_path / "tasks.jsonl"
+    tasks = [{"task_id": {"taskset": "native", "task_id": str(i)}, "task_input": {"scenario": i}} for i in range(3)]
+    source.write_text("".join(json.dumps(row) + "\n" for row in tasks))
+    calls = []
+
+    async def post(**kwargs):
+        assert kwargs["url_path"] == "/run" and kwargs["server_name"] == "environment"
+        request = kwargs["json"]
+        task = request["task"]["task_id"]["task_id"]
+        attempt = request["episode_id"]["attempt"]
+        calls.append((task, attempt))
+        identity = {"episode_id": request["episode_id"], "task_id": request["task"]["task_id"]}
+        if task == "0":
+            # A custom protocol can complete without a score or an LLM response.
+            return FakeResponse(200, identity | {"result": {"artifact": "done", "mask_sample": masked_unscored}})
+        if task == "1" and attempt == 1:
+            return FakeResponse(200, identity | {"result": {"reward": 0.0}})
+        return FakeResponse(200, identity | {"failure": {"message": "setup failed", "terminal": task == "2"}})
+
+    client = install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+    client.global_config_dict = OmegaConf.create({"environment": {"environment_servers": {"custom": {"scenario": 1}}}})
+    config = RolloutCollectionConfig(
+        input_jsonl_fpath=str(source),
+        output_jsonl_fpath=str(tmp_path / "out.jsonl"),
+        environment_server_routes={"native": "environment"},
+        route_failures_to_sidecar=True,
+        retain_results_in_memory=retain_results,
+        max_resident_rollout_tasks=1,
+        disable_aggregation=True,
+        disable_health_check=True,
+    )
+    await RolloutCollectionHelper().run_from_config(config)
+    store = RolloutStore.read(Path(config.output_jsonl_fpath))
+    assert store.coverage()["successful"] == 1
+    assert store.coverage()["unscored"] == 1 and store.coverage()["measured"] == 0
+    assert store.selected("success")[0]["artifact"] == "done"
+    assert all("reward" not in failure for failure in store.failures())
+    assert all(failure["_ng_failure_record"]["stage"] == "environment" for failure in store.failures())
+    config.resume_from_cache = True
+    await RolloutCollectionHelper().run_from_config(config)
+    store = RolloutStore.read(Path(config.output_jsonl_fpath))
+    assert calls == [("0", 0), ("1", 0), ("2", 0), ("1", 1)]
+    assert store.coverage()["successful"] == 2
+    assert store.coverage()["measured"] == 1 and store.coverage()["unscored"] == 1
+    assert store.coverage()["failed"] == 1
+    assert store.selected("success")[1]["reward"] == 0.0
+    config.require_complete = True
+    with pytest.raises(RuntimeError, match="2/3 samples completed"):
+        await RolloutCollectionHelper().run_from_config(config)
+    assert len(calls) == 4  # The unscored completion and terminal failure are not retried.
+    monkeypatch.setattr(RolloutCollectionHelper, "_call_aggregate_metrics", AsyncMock(return_value=None))
+    merged = Path(config.output_jsonl_fpath).with_name("merged.jsonl")
+    await collection.RolloutAggregationHelper().run_from_config(
+        collection.RolloutAggregationConfig(
+            input_glob=config.output_jsonl_fpath,
+            output_jsonl_fpath=str(merged),
+            disable_health_check=True,
+        )
+    )
+    offline = json.loads(coverage_path_for(merged).read_text())
+    assert (offline["successful"], offline["measured"], offline["masked"], offline["unscored"], offline["scored"]) == (
+        2,
+        1,
+        0,
+        1,
+        1,
+    )
+
+
+async def test_native_materialized_judge_input_can_append_reverification(tmp_path, monkeypatch):
+    from nemo_gym.rollout_store import RolloutStore
+
+    source = tmp_path / "tasks.jsonl"
+    row = {
+        "task_id": {"taskset": "native", "task_id": "question-1"},
+        "task_input": {
+            "responses_create_params": {"input": "What is 6 * 7?"},
+            "task_data": {"expected_answer": "42"},
+        },
+        "_ng_task_index": 0,
+        "_ng_rollout_index": 0,
+        "_ng_environment_server": "environment",
+    }
+    source.write_text(json.dumps(row) + "\n")
+    servers = {
+        "environment": {"environment_servers": {"single_agent_turn": {"resources_server": {"name": "judge"}}}},
+        "judge": {"resources_servers": {"example": {}}},
+    }
+    output = tmp_path / "out.jsonl"
+    unscored = row | {"_ng_task_index": 1, "task_id": {"taskset": "native", "task_id": "question-2"}}
+    rows = [row, unscored]
+    manifest = RunManifest.create(source, rows, {}, servers)
+    response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": "42"}]}]}
+    # An already classified judge failure exercises the input-shape bridge. Native
+    # EpisodeFailure -> judge_failed conversion is a separate producer contract.
+    with RolloutStore.start_or_resume(output, lambda: (rows, manifest), resume=False) as store:
+        dispatched = store.pending(3)[0]
+        store.record_dispatch(dispatched)
+        store.record_outcome(
+            dispatched
+            | {
+                "_ng_failure_class": "judge_failed",
+                "response": response,
+                "_ng_result_type": "single_agent_turn",
+                "_ng_task_id": row["task_id"],
+            }
+        )
+
+        unscored_dispatch = store.pending(3)[1]
+        store.record_dispatch(unscored_dispatch)
+        store.record_outcome(unscored_dispatch | {"artifact": "completed without a score"})
+
+    async def post(**kwargs):
+        assert kwargs["server_name"] == "judge" and kwargs["url_path"] == "/verify"
+        payload = kwargs["json"]
+        assert "task_input" not in payload and "task_id" not in payload
+        assert payload["expected_answer"] == "42"
+        assert payload["responses_create_params"] == row["task_input"]["responses_create_params"]
+        assert payload["response"] == response and payload["_ng_attempt_index"] == 1
+        assert RolloutStore.read(output).coverage()["unknown"] == 1
+        return FakeResponse(200, {"reward": 1.0, "response": payload["response"]})
+
+    client = install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+    client.global_config_dict = OmegaConf.create(servers)
+    monkeypatch.setattr(reverification, "setup_server_client", lambda: client)
+    monkeypatch.setattr(reverification, "raise_for_status", collection.raise_for_status)
+    monkeypatch.setattr(reverification, "get_response_json", collection.get_response_json)
+    exported = []
+    monkeypatch.setattr(reverification, "get_exporters", lambda: True)
+    monkeypatch.setattr(reverification, "export_metrics", lambda metrics: exported.append(metrics))
+    monkeypatch.setattr(reverification, "export_rollouts", lambda rows: None)
+    config = reverification.RolloutReverificationConfig(
+        materialized_inputs_jsonl_fpath=str(output.with_name("out_materialized_inputs.jsonl")),
+        rollouts_jsonl_fpath=str(output),
+        output_jsonl_fpath=str(output),
+        judge_failed_only=True,
+        append=True,
+        disable_aggregation=True,
+    )
+    results = await reverification.RolloutReverificationHelper().run_from_config(config)
+    assert len(results) == 2 and results[0]["reward"] == 1.0
+    assert results[1]["artifact"] == "completed without a score"
+    assert exported[-1] == {"coverage/expected": 2, "coverage/scored": 1, "coverage/missing": 1}
+    assert results[0]["_ng_task_id"] == row["task_id"] and results[0]["_ng_result_type"] == "single_agent_turn"
+    assert RolloutStore.read(output).coverage()["complete"]
+    await reverification.RolloutReverificationHelper().run_from_config(config)
+    assert client.post.await_count == 1  # No generation or duplicate judge request.
+
+
+@pytest.mark.parametrize("mismatch", ["attempt", "task", "reserved_result"])
+async def test_native_typed_outcomes_reject_foreign_identity_without_stopping_other_work(monkeypatch, mismatch):
+    rows = [
+        {
+            "task_id": {"taskset": "native", "task_id": str(i)},
+            "task_input": {},
+            "_ng_task_index": i,
+            "_ng_rollout_index": 0,
+            "_ng_environment_server": "environment",
+        }
+        for i in range(2)
+    ]
+
+    async def post(**kwargs):
+        request = kwargs["json"]
+        result = {
+            "episode_id": dict(request["episode_id"]),
+            "task_id": dict(request["task"]["task_id"]),
+            "result": {"artifact": "completed"},
+        }
+        if result["task_id"]["task_id"] == "0":
+            if mismatch == "attempt":
+                result["episode_id"]["attempt"] = 5
+            elif mismatch == "task":
+                result["task_id"]["task_id"] = "foreign"
+            else:
+                result["result"]["_ng_run_id"] = "foreign"
+        return FakeResponse(200, result)
+
+    client = install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+    client.global_config_dict = OmegaConf.create({"environment": {"environment_servers": {"custom": {}}}})
+    outcomes = {
+        row["_ng_task_index"]: result
+        for row, result in await asyncio.gather(*RolloutCollectionHelper().run_outcomes(rows))
+    }
+    assert isinstance(outcomes[0], RolloutFailure) and outcomes[0].stage == "result"
+    assert outcomes[0].rollout_id == "0-0" and outcomes[0].attempt_index == 0
+    assert outcomes[1]["artifact"] == "completed"
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_resume_identity_includes_environment_protocol_but_ignores_its_runtime_address(saved_manifest, native):
+    source, rows, _, config, _, _, _ = saved_manifest
+    servers = {
+        "agent": {"responses_api_agents": {"impl": {}}},
+        "environment": {
+            "environment_servers": {
+                "single_agent_turn": {
+                    "agent_server": {"name": "agent"},
+                    "resources_server": {"name": "judge"},
+                    "scenario": 1,
+                    "port": 8000,
+                }
+            }
+        },
+        "judge": {"resources_servers": {"impl": {"scoring_rule": 1}}},
+        "unused": {"environment_servers": {"custom": {"scenario": "${oc.env:GYM_UNUSED_TEST_ENVIRONMENT}"}}},
+    }
+    rows = [dict(rows[0], agent_ref={"name": "agent"})]
+    if native:
+        rows[0]["_ng_environment_server"] = "environment"
+        rows[0].pop("agent_ref")
+    before = RunManifest.create(source, rows, config, servers).config_digest
+    settings = servers["environment"]["environment_servers"]["single_agent_turn"]
+    settings["port"] = 9000
+    assert (
+        RunManifest.create(
+            source, rows, config | {"retain_results_in_memory": False, "max_resident_rollout_tasks": 1}, servers
+        ).config_digest
+        == before
+    )
+    settings["scenario"] = 2
+    assert RunManifest.create(source, rows, config, servers).config_digest != before
+    settings["scenario"] = 1
+    servers["judge"]["resources_servers"]["impl"]["scoring_rule"] = 2
+    assert RunManifest.create(source, rows, config, servers).config_digest != before
+
+
 @pytest.mark.parametrize("route_failures", [False, True])
 @pytest.mark.parametrize("append", [False, True])
 @pytest.mark.parametrize("answer", ["42", ""])
@@ -1011,6 +1245,7 @@ async def test_runner_journals_before_request_and_resumes_only_failed_work(
         "coverage/missing": 3 - report["scored"],
         "coverage/measured": 0,
         "coverage/masked": 1,
+        "coverage/unscored": 0,
         "coverage/failed": 1,
         "coverage/omitted": 1,
         "coverage/unknown": 0,
@@ -1077,6 +1312,11 @@ async def test_progress_masking_matches_persisted_outcomes(runner_config, monkey
 
     client = install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
     client.global_config_dict["dropped_agent"] = {"responses_api_agents": {"impl": {}}}
+    client.global_config_dict["dropped_environment"] = {
+        "environment_servers": {
+            "legacy_agent": {"agent_server": {"type": "responses_api_agents", "name": "dropped_agent"}}
+        }
+    }
     await RolloutCollectionHelper().run_from_config(runner_config)
     progress = [metrics for metrics in exported if "progress/total/rollouts_per_min" in metrics][-1]
     assert progress["progress/my_agent/masked_pct"] == 50.0
