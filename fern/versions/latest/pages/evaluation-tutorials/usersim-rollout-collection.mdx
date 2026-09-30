@@ -156,13 +156,14 @@ The Environment Server routes typed activation requests for two participant role
 
 UserSim's native runtime owns the episode lifecycle and asks the Environment Server for each typed participant
 or support activation. The Environment Server routes participant activations as Responses API requests through
-the matching Agent Server and support activations directly to the support Model Server. For `tool_calling`,
-`safety_agentic`, and `financial_services`, the Resources Server creates exactly one episode-scoped UserSim
-runtime with `ProbeEpisodeRuntime.from_resolved_row`. That runtime publishes the simulated tools and loop policy.
-The Assistant Agent mechanically executes model-to-tool-to-model iteration under that policy against standard
-Resources endpoints. The Environment Server never constructs a second copy of the probe or owns the tool loop.
-UserSim assigns semantic tool turn/call indices, including ordered parallel batches. Resources returns each
-single simulated payload as opaque text, so plain-text mocks are not JSON-wrapped or retried.
+the matching Agent Server and support activations directly to the support Model Server. For every probe, the
+Resources Server creates exactly one episode-scoped UserSim runtime with
+`ProbeEpisodeRuntime.from_resolved_row`. For `tool_calling`, `safety_agentic`, and `financial_services`, that
+runtime also publishes simulated tools and a tool-loop policy. The Assistant Agent mechanically executes
+model-to-tool-to-model iteration under that policy against standard Resources endpoints. The Environment Server
+never constructs a second copy of the probe or owns the tool loop. UserSim assigns semantic tool turn/call
+indices, including ordered parallel batches. Resources returns each single simulated payload as opaque text, so
+plain-text mocks are not JSON-wrapped or retried.
 
 The **Judge** and **Summary** support aliases are model calls rather than Agents. Native non-tool conversations
 can invoke them for semantic checks and optional context processing; Resources-owned verification, probe
