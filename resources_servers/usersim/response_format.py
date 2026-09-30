@@ -26,6 +26,9 @@ def responses_json_schema(schema: Mapping[str, Any], *, strict: bool) -> dict[st
 def _make_strict(node: Any) -> None:
     if isinstance(node, dict):
         node.pop("default", None)
+        if "$ref" in node and len(node) > 1:
+            reference = node.pop("$ref")
+            node["anyOf"] = [{"$ref": reference}]
         properties = node.get("properties")
         if node.get("type") == "object" and isinstance(properties, dict):
             node["additionalProperties"] = False

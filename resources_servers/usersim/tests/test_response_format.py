@@ -60,6 +60,28 @@ def test_strict_schema_recursively_closes_native_tool_scorer_objects() -> None:
     assert "additionalProperties" not in original["$defs"]["axis"]
 
 
+def test_strict_schema_wraps_ref_siblings_without_losing_descriptions() -> None:
+    original = {
+        "$defs": {"score": {"enum": [1, 3, 5], "type": "integer"}},
+        "type": "object",
+        "properties": {
+            "score": {
+                "$ref": "#/$defs/score",
+                "description": "Native scorer guidance",
+            }
+        },
+    }
+
+    adapted = responses_json_schema(original, strict=True)
+
+    score = adapted["properties"]["score"]
+    assert score == {
+        "anyOf": [{"$ref": "#/$defs/score"}],
+        "description": "Native scorer guidance",
+    }
+    assert original["properties"]["score"]["$ref"] == "#/$defs/score"
+
+
 def test_non_strict_schema_keeps_native_shape() -> None:
     original = {
         "type": "object",
