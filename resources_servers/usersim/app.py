@@ -263,6 +263,7 @@ class _ResourcesModelFacade:
 class UserSimResourcesServer(SimpleResourcesServer):
     """Resolve one replayable persona and general-purpose probe per episode."""
 
+    ray_enabled = False
     config: UserSimResourcesServerConfig
     session_id_to_seed: dict[str, SeededUserSimEpisode] = Field(default_factory=dict)
     locale_to_personas: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)

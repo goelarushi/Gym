@@ -22,6 +22,7 @@ from nemo_gym.config_types import AgentServerRef, ModelServerRef, ResourcesServe
 from nemo_gym.episode_types import EpisodeId, MaterializedTask, TaskId
 from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.server_utils import BaseServerConfig, ServerClient
+from resources_servers.usersim.app import UserSimResourcesServer
 from resources_servers.usersim.episode_contracts import (
     ProbeRuntimeDescriptor,
     UserSimActivationRequest,
@@ -271,6 +272,11 @@ def _environment_server(*, token_capture: bool = False) -> tuple[UserSimEnvironm
         resources_tool_transports=["direct_http"],
     )
     return UserSimEnvironmentServer(config=config, server_client=client), client
+
+
+def test_shipped_usersim_servers_disable_ray() -> None:
+    assert UserSimResourcesServer.ray_enabled is False
+    assert UserSimEnvironmentServer.ray_enabled is False
 
 
 def _request() -> UserSimEpisodeRequest:
