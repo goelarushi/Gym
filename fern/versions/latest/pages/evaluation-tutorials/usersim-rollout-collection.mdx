@@ -12,7 +12,7 @@ NeMo Gym runs their conversations with your assistant at scale and records the r
 
 By the end of this tutorial, you will:
 
-1. Prepare a reusable population of simulated users.
+1. Materialize canonical UserSim episode inputs.
 2. Run one multi-turn conversation against your model endpoint.
 3. Inspect the conversation, score, and underlying model calls.
 4. Optionally expand the run across 14 included evaluation scenarios.
@@ -21,10 +21,10 @@ By the end of this tutorial, you will:
 
 At a conceptual level, a UserSim rollout has four stages:
 
-1. **Prepare personas:** UserSim samples a persona panel that represents the population you want to simulate.
-2. **Resolve scenarios:** Preparation combines each task template with one panel persona and a **probe**. A probe
-   is a reusable scenario that tests a behavior, such as answering educational questions, using tools, or
-   maintaining safety boundaries.
+1. **Resolve episode inputs:** UserSim's canonical sampler resolves persona, probe, theme, toolset, locale,
+   configuration, trajectory identity, and provenance. A **probe** tests a behavior such as answering
+   educational questions, using tools, or maintaining safety boundaries.
+2. **Wrap Gym tasks:** Gym places each unchanged UserSim row in a task envelope without resampling it.
 3. **Hold a conversation:** A simulated user and the assistant exchange messages over multiple dialogue rounds.
    UserSim decides when the user's goal has been met or the conversation should stop.
 4. **Verify the result:** Gym stores the complete episode and UserSim's probe-specific evidence and score.
@@ -40,8 +40,8 @@ architecture section later on explains it for readers who want to customize mode
 </Note>
 
 <Info>
-The UserSim integration is under active development. It currently installs a pinned UserSim source revision
-from GitHub over SSH. The installation host needs access to
+The UserSim integration is under active development. It currently installs UserSim revision
+`4fd4c800bbef8883329543df632f328860fc6429` from GitHub over SSH. The installation host needs access to
 [NVIDIA-NeMo/UserSim](https://github.com/NVIDIA-NeMo/UserSim).
 </Info>
 
@@ -82,7 +82,7 @@ that reliably honors JSON-schema response formats avoids coupling structured eva
 reasoning behavior. The rollout commands below enable reasoning parsing for `policy_model` and explicitly
 disable it for `support_model` (which is also the default).
 
-## Prepare the persona panel
+## Prepare resolved inputs
 
 Run preparation once before starting the servers:
 
@@ -90,27 +90,29 @@ Run preparation once before starting the servers:
 gym eval prepare --config environments/usersim/config.yaml
 ```
 
-Preparation invokes `usersim panel` and writes:
+Preparation calls `usersim.engine.external.materialize_episode_inputs(...)` in the isolated environment and
+writes `environments/usersim/data/example.jsonl`. It produces one deterministic row for every registered
+probe. UserSim—not Gym—owns all sampled content and provenance.
 
-```text
-environments/usersim/data/personas/0.0.2/panels/
-├── en_US.parquet
-└── en_US.manifest.json
+The equivalent UserSim CLI contract for one selected probe is:
+
+```bash
+usersim simulate \
+  --locale en_US \
+  --num-rows 1 \
+  --probe-mix tool_calling=1 \
+  --random-seed 42 \
+  --materialize-inputs \
+  --out episode-inputs.jsonl
 ```
-
-The Parquet file is the prepared population artifact. Its manifest records the panel checksum, byte size, row
-count, locale, dataset version, and pinned UserSim revision. Preparation resolves the 14 tracked templates at
-`resources_servers/usersim/data/example_source.jsonl` against that panel and writes the ignored runnable
-dataset at `environments/usersim/data/example.jsonl`. Each runnable row contains the complete persona, locale,
-seed, probe, theme, goal, probe data, and panel/UserSim provenance. The Resources Server validates this data
-instead of independently selecting another scenario.
 
 Inspect the prepared inputs:
 
 ```bash
-jq . environments/usersim/data/personas/0.0.2/panels/en_US.manifest.json
 wc -l environments/usersim/data/example.jsonl
-jq . environments/usersim/data/example.jsonl
+jq '.task_input.resolved_row | {
+  probe_type, trajectory_id, usersim_provenance, usersim_config
+}' environments/usersim/data/example.jsonl
 ```
 
 ## Collect one rollout
@@ -130,15 +132,14 @@ gym eval run \
   --num-repeats 1 \
   +policy_uses_reasoning_parser=true \
   +support_model_uses_reasoning_parser=false \
-  ++usersim_resources.resources_servers.usersim.max_turns=2 \
   ++observability_enabled=true \
   ++model_call_capture_dir="${capture_dir}"
 ```
 
 `gym eval run` starts the required Environment, Resources, Agent, and Model Servers for this command. Increase
-the limit only after the smoke rollout completes. Here, `max_turns=2` bounds UserSim to two outer
-User/Assistant dialogue rounds. It does not bound the Assistant Agent's internal model/tool steps. A tool probe
-can make several model calls inside one Assistant activation before returning its final user-visible reply.
+the limit only after the smoke rollout completes. UserSim's materialized row owns outer-turn configuration.
+A tool probe can make several model calls inside one Assistant activation before returning its final
+user-visible reply.
 The two reasoning-parser flags describe what each upstream endpoint returns, not whether the role is a
 participant or support role. Set either flag to `false` only when that endpoint does not return parsed
 reasoning fields.
@@ -157,9 +158,11 @@ UserSim's native runtime owns the episode lifecycle and asks the Environment Ser
 or support activation. The Environment Server routes participant activations as Responses API requests through
 the matching Agent Server and support activations directly to the support Model Server. For `tool_calling`,
 `safety_agentic`, and `financial_services`, the Resources Server creates exactly one episode-scoped UserSim
-runtime from the prepared scenario. That runtime resolves the simulated tools and publishes the loop policy.
+runtime with `ProbeEpisodeRuntime.from_resolved_row`. That runtime publishes the simulated tools and loop policy.
 The Assistant Agent mechanically executes model-to-tool-to-model iteration under that policy against standard
 Resources endpoints. The Environment Server never constructs a second copy of the probe or owns the tool loop.
+UserSim assigns semantic tool turn/call indices, including ordered parallel batches. Resources returns each
+single simulated payload as opaque text, so plain-text mocks are not JSON-wrapped or retried.
 
 The **Judge** and **Summary** support aliases are model calls rather than Agents. Native non-tool conversations
 can invoke them for semantic checks and optional context processing; Resources-owned verification, probe
@@ -168,7 +171,7 @@ endpoint settings. They may contain the same values only when that upstream mode
 reasoning and strict structured output; the Gym aliases remain distinct.
 
 Persisted Environment-owned invocations use the semantic `user`, `assistant`, `judge`, and `summary` roles as
-applicable. The Resources Server separately owns the prepared panel, canonical tool-probe runtime,
+applicable. The Resources Server separately owns the canonical tool-probe runtime,
 tool-result synthesis, and final verification. Its `probe_scorer_model` also references `support_model`.
 
 Prepared task rows can provide optional per-role request defaults through `responses_create_params`. The
@@ -259,7 +262,7 @@ After inspecting the smoke rollout, remove `--limit 1` to run the 14 prepared ex
 ```bash
 gym eval run \
   --environment usersim \
-  --split example \
+  --split benchmark \
   --output results/usersim/all-probes.jsonl \
   --num-repeats 1 \
   +policy_uses_reasoning_parser=true \
