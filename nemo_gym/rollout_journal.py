@@ -147,17 +147,18 @@ def prepare_append(path: Path) -> None:
             return
         end = file.tell()
         start = end
-        tail = b""
+        # Search each chunk once. Growing and rescanning a bytes buffer here is
+        # quadratic for large interrupted trajectory records.
         while start:
-            size = min(start, 8192)
+            size = min(start, 1 << 20)
             start -= size
             file.seek(start)
-            tail = file.read(size) + tail
-            split = tail.rfind(b"\n")
+            split = file.read(size).rfind(b"\n")
             if split >= 0:
                 start += split + 1
-                tail = tail[split + 1 :]
                 break
+        file.seek(start)
+        tail = file.read(end - start)
         try:
             orjson.loads(tail)
         except orjson.JSONDecodeError:

@@ -58,7 +58,11 @@ from nemo_gym.rollout_collection import (
     NG_RESULT_TYPE_KEY,
     NG_TERMINAL_KEY,
     _coverage_report,
+    _failure_compatibility_row,
+    _failure_diagnostics,
+    _failure_outcome,
     _get_max_rollout_attempts,
+    _judge_failure_response,
     _rollout_for_export,
     _rollout_request_debug_summary,
 )
@@ -77,6 +81,9 @@ from nemo_gym.server_utils import (
 # Todo after merging branch `edobrowolska/judge_failures_v2`: replace this by importing from judge.py
 JUDGE_FAILED_FAILURE_CLASS = "judge_failed"
 ATIF_PROVENANCE_KEY = "_ng_atif_provenance"
+_LOCAL_EVIDENCE_KEYS = frozenset(
+    {ATIF_PROVENANCE_KEY, "ng_trajectory", "ng_agent_observations", "ng_model_call_capture"}
+)
 ATIF_NO_PERSIST_FAILURE_CLASS = "kill_shaped"
 _CONFIG_BOOL_ADAPTER = TypeAdapter(bool)
 
@@ -580,7 +587,9 @@ def _build_verify_payload(pair: InputRolloutPair) -> Dict:
 
 def _verification_request_body(row: Dict) -> Dict:
     """Flatten native task input only at dispatch, after recovery validates its identity."""
-    request = {key: value for key, value in row.items() if key != ATIF_PROVENANCE_KEY}
+    # Evidence stays on the local payload for output/health checks; the verifier
+    # needs the task and saved response, not captured model-call traffic.
+    request = {key: value for key, value in row.items() if key not in _LOCAL_EVIDENCE_KEYS}
     task_input = request.get("task_input")
     if not isinstance(task_input, dict):
         return request
@@ -845,7 +854,9 @@ async def _call_aggregate_metrics(
         stripped = []
         for r in agent_result_list:
             entry = {
-                k: v for k, v in r.items() if k not in ("response", "responses_create_params", ATIF_PROVENANCE_KEY)
+                k: v
+                for k, v in r.items()
+                if k not in ("response", "responses_create_params") and k not in _LOCAL_EVIDENCE_KEYS
             }
             usage = (r.get("response") or {}).get("usage")
             if usage:
@@ -1097,6 +1108,10 @@ class RolloutReverificationHelper(BaseModel):
                     else:
                         # Reported kill-shaped failures consume a dispatched
                         # attempt, matching collection's journal policy.
+                        if failure_class is not None:
+                            result = _failure_diagnostics(result) | _failure_compatibility_row(
+                                _failure_outcome(row, result, "verifier"), _judge_failure_response(result)
+                            )
                         result.pop(NG_NO_PERSIST_KEY, None)
                         store.record_outcome(result)
 

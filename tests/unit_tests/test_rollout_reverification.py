@@ -809,6 +809,8 @@ class TestBuildVerifyPayload:
         )
         result = _build_verify_payload(pair)
         assert result == {"task": "q1", "response": pair.rollout["response"], "ng_trajectory": trajectory}
+        assert _verification_request_body(result) == {"task": "q1", "response": pair.rollout["response"]}
+        assert result["ng_trajectory"] == trajectory
         assert pair.input == {"task": "q1"}
 
     def test_merges_input_row_with_response(self) -> None:
@@ -1835,6 +1837,9 @@ class TestCallAggregateMetrics:
                     "usage": {"prompt_tokens": 10, "completion_tokens": 5},
                 },
                 "responses_create_params": {"input": "large prompt content", "model": "llm"},
+                "ng_trajectory": {"model_calls": [{"request": "large captured request"}]},
+                "ng_agent_observations": {"turns": ["large saved observation"]},
+                "ng_model_call_capture": {"calls": ["large captured response"]},
                 ATIF_PROVENANCE_KEY: {
                     "trajectory_id": "trajectory-1",
                     "source_sha256": "a" * 64,
@@ -1861,6 +1866,9 @@ class TestCallAggregateMetrics:
         # response body stripped, responses_create_params stripped
         assert "responses_create_params" not in sent
         assert ATIF_PROVENANCE_KEY not in sent
+        assert "ng_trajectory" not in sent
+        assert "ng_agent_observations" not in sent
+        assert "ng_model_call_capture" not in sent
         assert sent.get("response") == {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
 
         # other fields preserved

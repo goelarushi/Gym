@@ -4036,7 +4036,7 @@ class TestRolloutCollection:
 
         actual_returned_results = await TestRolloutCollectionHelper().run_from_config(config)
 
-        assert [result.get("case") for result in actual_returned_results] == ["case-0", None, "case-2"]
+        assert [result["case"] for result in actual_returned_results] == ["case-0", "case-1", "case-2"]
         assert [result["case"] for result in captured["results"]] == ["case-0"]
         assert [row["x"] for row in captured["rows"]] == [0]
 

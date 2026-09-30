@@ -19,6 +19,7 @@ import signal
 from collections import Counter
 from contextlib import contextmanager
 from itertools import permutations, product
+from pathlib import Path
 
 import orjson
 import pytest
@@ -257,6 +258,53 @@ def test_complete_unterminated_tail_gets_a_newline(tmp_path):
     prepare_append(path)
     assert path.read_bytes() == original + b"\n"
     assert list(read_records(path)) == [{"a": 1}, {"a": 2}]
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_large_tail_repair_scans_a_linear_amount_of_data(tmp_path, monkeypatch, complete):
+    path = tmp_path / "large-tail.jsonl"
+    prefix = b'{"saved": true}\n'
+    tail = b'{"capture": "' + b"x" * (256 << 10) + (b'"}' if complete else b"")
+    path.write_bytes(prefix + tail)
+    scanned = 0
+    original_open = Path.open
+    original_loads = orjson.loads
+
+    class CountedBytes(bytes):
+        def __add__(self, other):
+            return CountedBytes(super().__add__(other))
+
+        def rfind(self, *args):
+            nonlocal scanned
+            scanned += len(self)
+            return super().rfind(*args)
+
+    class Reader:
+        def __init__(self, file):
+            self.file = file
+
+        def read(self, *args):
+            return CountedBytes(self.file.read(*args))
+
+        def __getattr__(self, name):
+            return getattr(self.file, name)
+
+    @contextmanager
+    def tracked_open(self, *args, **kwargs):
+        with original_open(self, *args, **kwargs) as file:
+            yield Reader(file) if self == path else file
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", tracked_open)
+        # orjson requires an exact built-in bytes object, not our scan counter.
+        patch.setattr(orjson, "loads", lambda raw: original_loads(bytes(raw)))
+        if complete:
+            prepare_append(path)
+        else:
+            with pytest.warns(UserWarning, match="incomplete final"):
+                prepare_append(path)
+    assert path.read_bytes() == (prefix + tail + b"\n" if complete else prefix)
+    assert scanned <= 2 * len(prefix + tail)
 
 
 def test_interior_corruption_is_rejected(tmp_path):

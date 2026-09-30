@@ -620,9 +620,14 @@ async def test_native_typed_outcomes_reject_foreign_identity_without_stopping_ot
 
 
 @pytest.mark.parametrize("native", [False, True])
-def test_resume_identity_includes_environment_protocol_but_ignores_its_runtime_address(saved_manifest, native):
+@pytest.mark.parametrize("reference", ["literal", "name", "mapping"])
+def test_resume_identity_includes_environment_protocol_but_ignores_its_runtime_address(
+    saved_manifest, native, reference
+):
     source, rows, _, config, _, _, _ = saved_manifest
     servers = {
+        "agent_name": "agent",
+        "agent_reference": {"name": "${agent_name}"},
         "agent": {"responses_api_agents": {"impl": {}}},
         "environment": {
             "environment_servers": {
@@ -637,12 +642,16 @@ def test_resume_identity_includes_environment_protocol_but_ignores_its_runtime_a
         "judge": {"resources_servers": {"impl": {"scoring_rule": 1}}},
         "unused": {"environment_servers": {"custom": {"scenario": "${oc.env:GYM_UNUSED_TEST_ENVIRONMENT}"}}},
     }
+    settings = servers["environment"]["environment_servers"]["single_agent_turn"]
+    if reference == "name":
+        settings["agent_server"] = {"name": "${agent_name}"}
+    elif reference == "mapping":
+        settings["agent_server"] = "${agent_reference}"
     rows = [dict(rows[0], agent_ref={"name": "agent"})]
     if native:
         rows[0]["_ng_environment_server"] = "environment"
         rows[0].pop("agent_ref")
     before = RunManifest.create(source, rows, config, servers).config_digest
-    settings = servers["environment"]["environment_servers"]["single_agent_turn"]
     settings["port"] = 9000
     assert (
         RunManifest.create(
@@ -655,6 +664,89 @@ def test_resume_identity_includes_environment_protocol_but_ignores_its_runtime_a
     settings["scenario"] = 1
     servers["judge"]["resources_servers"]["impl"]["scoring_rule"] = 2
     assert RunManifest.create(source, rows, config, servers).config_digest != before
+
+
+@pytest.mark.parametrize("route_failures", [False, True])
+@pytest.mark.parametrize("reason_key", ["error_message", "agent_error", "grading_notes"])
+async def test_failure_sidecar_preserves_producer_diagnostics(runner_config, monkeypatch, route_failures, reason_key):
+    runner_config.route_failures_to_sidecar = route_failures
+    reason = "The sandbox disconnected before producing a deliverable"
+    diagnostics = {
+        reason_key: reason,
+        "raw_rollout": {"archived_to": "saved-trace.json"},
+        "hermes_result_path": "saved-hermes-trace.json",
+        "verifier_reward": 0.25,
+        "hermes_return_code": 1,
+    }
+
+    async def post(**kwargs):
+        if kwargs["json"]["_ng_task_index"] == 1:
+            return FakeResponse(
+                200,
+                diagnostics | {"_ng_failure_class": "agent_run_error", "reward": 0.0, "response": {"output": []}},
+            )
+        return FakeResponse(200, {"reward": 0.0, "response": {}})
+
+    install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+    returned = await RolloutCollectionHelper().run_from_config(runner_config)
+    [saved] = read_records(collection.failures_path_for(Path(runner_config.output_jsonl_fpath)))
+    for key, value in diagnostics.items():
+        assert saved[key] == value
+    assert saved["_ng_failure_record"]["failure_reason"] == reason
+    assert "reward" not in saved and "response" not in saved
+    assert next(row for row in returned if row["_ng_task_index"] == 1) == saved
+
+
+async def test_unbounded_interruption_consumes_attempts_until_the_cap_is_raised(tmp_path, monkeypatch):
+    from nemo_gym.rollout_store import RolloutStore
+
+    rows = [failing_row(index) for index in range(4)]
+    source = tmp_path / "inputs.jsonl"
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    output = tmp_path / "rollouts.jsonl"
+
+    def prepare():
+        return rows, RunManifest.create(source, rows, {}, {})
+
+    for restart in range(3):
+        queued = []
+        sent = []
+        all_queued = asyncio.Event()
+        blocked = asyncio.Event()
+        pool = asyncio.Semaphore(1)
+
+        async def post(**kwargs):
+            queued.append(kwargs["json"]["_ng_task_index"])
+            if len(queued) == len(rows):
+                all_queued.set()
+            # Simulate requests waiting in the HTTP client after Gym's dispatch.
+            async with pool:
+                sent.append(kwargs["json"]["_ng_task_index"])
+                await blocked.wait()
+
+        install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+        with RolloutStore.start_or_resume(output, prepare, resume=restart > 0) as store:
+            pending = store.pending(3)
+            assert len(pending) == len(rows)
+            dispatches = RolloutCollectionHelper()._run_examples_with_metadata(
+                pending, on_dispatch=store.record_dispatch
+            )
+            waiter = asyncio.create_task(next(dispatches))
+            try:
+                await asyncio.wait_for(all_queued.wait(), 5)
+                assert len(sent) == 1
+            finally:
+                waiter.cancel()
+                await dispatches.aclose()
+                await asyncio.gather(waiter, return_exceptions=True)
+
+    reader = RolloutStore.read(output)
+    assert reader.coverage()["unknown"] == len(rows)
+    assert reader.pending(3) == []
+    retry = reader.pending(4)
+    assert len(retry) == len(rows)
+    assert all(row["_ng_attempt_index"] == 3 for row in retry)
+    assert reader.selected("success") == [] and reader.failures() == []
 
 
 @pytest.mark.parametrize("route_failures", [False, True])
@@ -751,6 +843,7 @@ async def test_collected_judge_failure_can_be_reverified_without_inference(
     verify_request = next(
         call.kwargs["json"] for call in client.post.await_args_list if call.kwargs["url_path"] == "/verify"
     )
+    assert "ng_trajectory" not in verify_request
     assert "mask_sample" not in verify_request and "instance_config" not in verify_request
     assert set(by_task) == {0, 1}
     assert [call.kwargs["url_path"] for call in client.post.await_args_list].count("/run") == 3
@@ -778,6 +871,52 @@ async def test_collected_judge_failure_can_be_reverified_without_inference(
     assert health_after["issues"]["agent_turn_hollow"] == health_before["issues"]["agent_turn_hollow"]
     assert health_after["artifacts"]["coverage"]["agent_turn_hollow"]["evaluated"] == 1
     assert by_task[1]["ng_trajectory"] == failures[1]["ng_trajectory"]
+
+
+async def test_reverify_append_normalizes_repeated_judge_failures(runner_config, monkeypatch):
+    response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": "saved answer"}]}]}
+
+    async def post(**kwargs):
+        row = kwargs["json"]
+        if kwargs["url_path"] == "/verify" or row["_ng_task_index"] == 1:
+            return FakeResponse(
+                200,
+                {
+                    "_ng_failure_class": "judge_failed",
+                    "_ng_failure_judge_error": "Judge unavailable",
+                    "reward": 0.0,
+                    "response": response,
+                    "grading_notes": "Inspect judge-service.log",
+                },
+            )
+        return FakeResponse(200, {"reward": 0.0, "response": {}})
+
+    client = install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+    await RolloutCollectionHelper().run_from_config(runner_config)
+    monkeypatch.setattr(reverification, "setup_server_client", lambda: client)
+    monkeypatch.setattr(reverification, "_build_agent_to_resources_server_mapping", lambda _: {"my_agent": "rs"})
+    monkeypatch.setattr(reverification, "raise_for_status", collection.raise_for_status)
+    monkeypatch.setattr(reverification, "get_response_json", collection.get_response_json)
+    monkeypatch.setattr(reverification, "get_exporters", list)
+    config = reverification.RolloutReverificationConfig(
+        materialized_inputs_jsonl_fpath=str(runner_config.materialized_jsonl_fpath),
+        rollouts_jsonl_fpath=runner_config.output_jsonl_fpath,
+        output_jsonl_fpath=runner_config.output_jsonl_fpath,
+        judge_failed_only=True,
+        append=True,
+        disable_aggregation=True,
+    )
+    await reverification.RolloutReverificationHelper().run_from_config(config)
+    failures = list(read_records(collection.failures_path_for(Path(config.output_jsonl_fpath))))
+    assert len(failures) == 2
+    recovered = failures[-1]
+    failure = RolloutFailure.model_validate(recovered["_ng_failure_record"])
+    assert failure.failure_kind == "judge_failed" and failure.stage == "verifier"
+    assert failure.attempt_index == 1
+    assert recovered["grading_notes"] == "Inspect judge-service.log"
+    assert recovered["response"] == response and "reward" not in recovered
+    assert [call.kwargs["url_path"] for call in client.post.await_args_list].count("/run") == 3
+    assert [call.kwargs["url_path"] for call in client.post.await_args_list].count("/verify") == 1
 
 
 @pytest.mark.parametrize("newest", ["saved_answer", "agent_failure", "no_answer"])

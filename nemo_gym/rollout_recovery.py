@@ -176,15 +176,21 @@ def _configuration_identity(config: dict, global_config: dict, rows: list[dict])
     servers = {
         name for name, block in raw.items() if isinstance(block, dict) and any(k in block for k in _SERVER_KINDS)
     }
-    pending = {row.get("agent_ref", {}).get("name") for row in rows} - {None}
+    pending = {(row.get("agent_ref") or {}).get("name") for row in rows} - {None}
     pending.update(row["_ng_environment_server"] for row in rows if row.get("_ng_environment_server"))
     # Agent-routed legacy rows are wrapped by an Environment Server at dispatch.
     # Its orchestration settings are part of the task even without a row stamp.
-    agents = {row.get("agent_ref", {}).get("name") for row in rows if not row.get("_ng_environment_server")} - {None}
-    for name in servers:
-        for settings in raw[name].get("environment_servers", {}).values():
-            if isinstance(settings, dict) and (settings.get("agent_server") or {}).get("name") in agents:
-                pending.add(name)
+    agents = {(row.get("agent_ref") or {}).get("name") for row in rows if not row.get("_ng_environment_server")} - {
+        None
+    }
+    if agents:
+        for name in servers:
+            for settings in context[name].get("environment_servers", {}).values():
+                # Match dispatch's resolved reference, including whole-mapping
+                # interpolations, without resolving unrelated server settings.
+                reference = settings.get("agent_server") if OmegaConf.is_dict(settings) else None
+                if OmegaConf.is_dict(reference) and reference.get("name") in agents:
+                    pending.add(name)
     pending.update(row["task_source"] for row in rows if isinstance(row.get("task_source"), str))
     if not pending:
         pending = set(servers)

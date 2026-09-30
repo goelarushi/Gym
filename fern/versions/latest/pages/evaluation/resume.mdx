@@ -38,7 +38,7 @@ they do not promise survival of a machine or storage failure before buffered dat
 
 Use one collector per output path. For parallel jobs, give each shard its own output path and aggregate afterward.
 
-An infrastructure failure is eligible for another attempt according to the existing attempt limit and terminal markers.
+An infrastructure failure is eligible for another attempt according to the configured attempt limit and terminal markers.
 A completed wrong answer is a result, so it is not retried merely because its reward is zero.
 
 ## Environment Server boundary
@@ -74,6 +74,16 @@ exhaustion counts otherwise retryable failed or unknown outcomes, excluding comp
 intentional omissions, and never-dispatched work. It is additional retry-policy information, not another disposition
 in the coverage sum. Offline aggregation evaluates exhaustion using the currently configured cap; increasing the cap
 can make previously exhausted work eligible again.
+
+<Warning>
+The attempt cap applies across the entire saved run, including automatic Slurm restarts. An interruption consumes an
+attempt for each dispatched rollout that has not finished. With no concurrency or resident-task limit, this can include
+requests still waiting inside the HTTP client. Three interruptions can therefore exhaust unfinished work at the default
+cap, even without three recorded failures. Increase `NEMO_GYM_MAX_ROLLOUT_ATTEMPTS` for the resumed collector when more
+attempts are intended. `num_samples_in_parallel` and `max_resident_rollout_tasks` limit how many tasks reach dispatch at
+once; they do not refund interrupted attempts. The saved journal and coverage report distinguish unknown outcomes from
+recorded failures.
+</Warning>
 
 Explicit `_ng_rollout_id` values must be valid capture IDs. Preprocessing preserves them for single copies and adds
 `-r<rollout_index>` when repeats or agent fan-out expand a row. The resulting IDs must be unique within the run.
@@ -205,6 +215,10 @@ the consumers and the producer migration in [#3180](https://github.com/NVIDIA-Ne
 When routing is disabled, exceptions and malformed failure payloads can stop the run. Well-formed explicit failures are
 still accepted as data. Diagnostic observations, trajectories, and captured model calls are retained in the surrounding
 sidecar record, outside the canonical failure; they do not turn a failure into a completed training sample.
+
+Producer-specific error messages and diagnostic fields, such as archived trace paths, remain in the sidecar envelope.
+The bounded canonical failure record stays separate from those diagnostics. Journal-backed append reverification uses
+the same failure envelope as collection, discarding placeholder rewards while keeping genuine saved judge inputs.
 
 For a legacy `judge_failed` result that includes the actual generated response, the sidecar also preserves that
 `response` outside the canonical failure record, without a reward. This keeps `gym eval reverify --judge-failed-only`

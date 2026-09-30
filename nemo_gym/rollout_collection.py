@@ -1287,6 +1287,9 @@ def _failure_outcome(row: Dict, failure: Dict, stage: str) -> RolloutFailure:
             or failure.get("failure_reason")
             or failure.get("error")
             or failure.get("_ng_failure_judge_error")
+            or failure.get("error_message")
+            or failure.get("agent_error")
+            or failure.get("grading_notes")
             or "Agent reported a no-result failure"
         ),
         exception_type=failure.get("_ng_failure_type"),
@@ -1342,27 +1345,17 @@ def _judge_failure_response(result: Any) -> Optional[Dict]:
 
 
 def _failure_diagnostics(result: Any) -> Dict:
-    if not isinstance(result, dict):
+    """Preserve producer diagnostics outside the bounded canonical failure record."""
+    if not isinstance(result, dict) or (result.get(NG_FAILURE_CLASS_KEY) is None and result.get("type") != "failure"):
         return {}
-    return {
-        key: value
-        for key, value in result.items()
-        if key
-        in {
-            "ng_agent_observations",
-            "ng_model_call_capture",
-            NG_TRAJECTORY_KEY,
-            NG_PERF_KEY,
-            MASK_SAMPLE_KEY,
-            "failure_kind",
-            "failure_reason",
-            "instance_config",
-            "_ng_group_id",
-            "_ng_group_attempt",
-            NG_TASK_ID_KEY,
-        }
-        or key.startswith("_ng_failure_")
-    }
+    # Legacy producers use different names for errors, trace paths, and other
+    # evidence. Preserve their fields, but never turn placeholder scores or
+    # generation into a completed result. Actual judge input is restored separately.
+    excluded = {"reward", "response", NG_NO_PERSIST_KEY}
+    if result.get("type") == "failure":
+        # The envelope is a sidecar row; only _ng_failure_record is the typed model.
+        excluded.add("type")
+    return {key: value for key, value in result.items() if key not in excluded}
 
 
 def _failure_compatibility_row(failure: RolloutFailure, verification_response: Optional[Dict] = None) -> Dict:
