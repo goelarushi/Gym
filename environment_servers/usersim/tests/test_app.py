@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
 from typing import Any
 
 import orjson
@@ -12,9 +11,9 @@ from pydantic import ConfigDict
 from environment_servers.usersim.app import (
     UserSimEnvironmentServer,
     UserSimEnvironmentServerConfig,
-    _configured_model_name,
-    _create_usersim_generator,
+    _ConversationBridge,
     _is_retryable_dependency_error,
+    _response_output_messages,
     _to_responses_input_items,
 )
 from nemo_gym.base_environment_server import BaseEnvironmentServer
@@ -24,8 +23,8 @@ from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.server_utils import BaseServerConfig, ServerClient
 from resources_servers.usersim.episode_contracts import (
     ProbeRuntimeDescriptor,
+    UserSimActivationRequest,
     UserSimEpisodeRequest,
-    UserSimSeedResponse,
     UserSimTaskInput,
 )
 
@@ -92,12 +91,24 @@ def _model_response(response_id: str, text: str) -> dict[str, Any]:
         "parallel_tool_calls": True,
         "tool_choice": "auto",
         "tools": [],
+        "usage": {
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 2},
+            "output_tokens": 5,
+            "output_tokens_details": {"reasoning_tokens": 1},
+            "total_tokens": 15,
+        },
     }
 
 
 def _tool_model_response() -> dict[str, Any]:
     response = _model_response("assistant-response", "Done.")
     response["output"] = [
+        {
+            "id": "reasoning-1",
+            "summary": [{"text": "Inspect the tool result.", "type": "summary_text"}],
+            "type": "reasoning",
+        },
         {
             "id": "fc-1",
             "call_id": "call-1",
@@ -257,18 +268,8 @@ def _environment_server(*, token_capture: bool = False) -> tuple[UserSimEnvironm
         judge_model=ModelServerRef(type="responses_api_models", name="support"),
         summary_model=ModelServerRef(type="responses_api_models", name="support"),
         resources_tool_transports=["direct_http"],
-        max_turns=2,
     )
     return UserSimEnvironmentServer(config=config, server_client=client), client
-
-
-def test_configured_model_name_resolves_agent_and_direct_model_targets() -> None:
-    server, _ = _environment_server()
-
-    assert _configured_model_name(server, "user_model") == "nvidia/example-assistant-model"
-    assert _configured_model_name(server, "assistant_model") == "nvidia/example-assistant-model"
-    assert _configured_model_name(server, "judge_model") == "nvidia/example-support-model"
-    assert _configured_model_name(server, "summary_model") == "nvidia/example-support-model"
 
 
 def _request() -> UserSimEpisodeRequest:
@@ -277,7 +278,20 @@ def _request() -> UserSimEpisodeRequest:
         task=MaterializedTask(
             task_id=TaskId(taskset="usersim:example", task_id="task"),
             task_input=UserSimTaskInput(
-                sampling={"locale": "en_US", "seed": 42},
+                scenario={
+                    "persona": {"first_name": "Morgan"},
+                    "probe_type": "general_open_ended",
+                    "theme": {"type": "recommendation", "description": "Plan dinner."},
+                    "goal": "Plan dinner.",
+                    "locale": "en_US",
+                },
+                usersim_context={
+                    "locale": "en_US",
+                    "seed": 42,
+                    "personas_dataset_version": "0.0.2",
+                    "personas_panel_sha256": "a" * 64,
+                    "usersim_revision": "b" * 40,
+                },
                 responses_create_params={
                     "user": {"input": [], "temperature": 0.8},
                     "assistant": {"input": [], "temperature": 0.2},
@@ -309,15 +323,68 @@ def _queue_success_responses(client: _Client) -> None:
                         "personas_panel_sha256": "a" * 64,
                         "usersim_revision": "b" * 40,
                     },
+                    "assistant_tools": _runtime_descriptor().assistant_tools,
+                    "runtime_descriptor": _runtime_descriptor().model_dump(mode="json"),
                 },
                 cookie="resources-cookie",
             ),
             _Response({"agent_session_id": "user-session"}, cookie="user-cookie"),
             _Response({"agent_session_id": "assistant-session"}, cookie="assistant-cookie"),
+            _Response(
+                {
+                    "activation_id": "activation-000001",
+                    "role": "user",
+                    "model_alias": "user_model",
+                    "messages": [{"role": "user", "content": "write user"}],
+                    "parameters": {},
+                }
+            ),
             _Response(_model_response("user-response", "I need dinner advice.")),
+            _Response(
+                {
+                    "activation_id": "activation-000002",
+                    "role": "assistant",
+                    "model_alias": "assistant_model",
+                    "messages": [{"role": "user", "content": "I need dinner advice."}],
+                    "parameters": {"max_tokens": 128, "temperature": 0.3, "top_p": 0.9},
+                    "assistant_tool_loop_policy": _runtime_descriptor().loop_policy.model_dump(mode="json"),
+                }
+            ),
             _Response(_model_response("assistant-response", "Try a lentil curry.")),
+            _Response(
+                {
+                    "activation_id": "activation-000003",
+                    "role": "judge",
+                    "model_alias": "judge_model",
+                    "messages": [{"role": "user", "content": "judge"}],
+                    "parameters": {},
+                }
+            ),
             _Response(_model_response("judge-response", "<rating>pass</rating>")),
+            _Response(
+                {
+                    "activation_id": "activation-000004",
+                    "role": "summary",
+                    "model_alias": "summary_model",
+                    "messages": [{"role": "user", "content": "summarize"}],
+                    "parameters": {},
+                }
+            ),
             _Response(_model_response("summary-response", "The assistant recommended lentil curry.")),
+            _Response(
+                {
+                    "complete": True,
+                    "result": {
+                        "conversation_messages": [
+                            {"role": "user", "content": "I need dinner advice."},
+                            {"role": "assistant", "content": "Try a lentil curry."},
+                        ],
+                        "conversation_status": True,
+                        "simulation_outcome": {"status": "ok", "early_stop": True},
+                        "simulation_traces": [],
+                    },
+                }
+            ),
             _Response(
                 {
                     "agent_session_id": "assistant-session",
@@ -347,123 +414,45 @@ def _queue_success_responses(client: _Client) -> None:
     )
 
 
-def test_usersim_generator_uses_instance_api() -> None:
-    config = object()
-    models = {"user_model": object()}
-
-    class Generator:
-        @property
-        def config(self) -> object:
-            return self._config
-
-        def generate(self, data: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "config": self.config,
-                "model": self.get_model("user_model"),
-                "data": data,
-            }
-
-    generator = _create_usersim_generator(Generator, config, models)
-
-    assert isinstance(generator, Generator)
-    assert generator.generate({"probe_type": "general_open_ended"}) == {
-        "config": config,
-        "model": models["user_model"],
-        "data": {"probe_type": "general_open_ended"},
-    }
-
-
-async def test_tool_probe_uses_remote_driver_and_preserves_tool_transcript(monkeypatch) -> None:
-    environment_server, _ = _environment_server()
-    synchronized = []
-
-    async def synchronize(_bridge, transcript):
-        synchronized.append([dict(message) for message in transcript])
-
-    monkeypatch.setattr(environment_server, "_synchronize_runtime", synchronize)
-    monkeypatch.setattr(
-        "environment_servers.usersim.app._create_usersim_generator",
-        lambda *_args, **_kwargs: pytest.fail("tool probes must not construct a local UserSim generator"),
-    )
-
+def test_assistant_activation_preserves_complete_tool_transcript() -> None:
     response = NeMoGymResponse.model_validate(_tool_model_response())
+    transcript = _response_output_messages(response)
 
-    class Bridge:
-        resources_cookies = {"session": "resources"}
-        invocations = []
+    assert [message["role"] for message in transcript] == ["assistant", "tool", "assistant"]
+    assert transcript[0]["tool_calls"][0]["id"] == "call-1"
+    assert transcript[0]["reasoning_content"] == "Inspect the tool result."
+    assert transcript[1]["tool_call_id"] == "call-1"
 
-        async def invoke(self, alias, messages, *, max_tokens, tools):
-            assert alias == "assistant_model"
-            assert tools and tools[0]["function"]["name"] == "safe_action"
-            self.invocations.append(SimpleNamespace(response=response))
-            return SimpleNamespace(message=SimpleNamespace(content="Done."))
 
-    seed = UserSimSeedResponse.model_validate(
-        {
-            "resources_session_id": "resources-session",
-            "scenario": {
-                "persona": {"first_name": "Morgan"},
-                "probe_type": "safety_agentic",
-                "theme": "safety",
-            },
-            "usersim_context": {
-                "locale": "en_US",
-                "seed": 42,
-                "personas_dataset_version": "0.0.2",
-                "personas_panel_sha256": "a" * 64,
-                "usersim_revision": "b" * 40,
-            },
-            "runtime_descriptor": _runtime_descriptor().model_dump(mode="json"),
-        }
+async def test_conversation_bridge_rejects_role_alias_mismatch_before_invocation() -> None:
+    environment_server, client = _environment_server()
+    request = _request()
+    bridge = _ConversationBridge(
+        environment_server,
+        request,
+        request.task.task_input,
+        {},
+        {},
+        [],
     )
-    result = await environment_server._run_usersim(Bridge(), seed)
 
-    assert [message["role"] for message in result["conversation_messages"]] == [
-        "user",
-        "assistant",
-        "tool",
-        "assistant",
-    ]
-    assert result["conversation_messages"][1]["tool_calls"][0]["id"] == "call-1"
-    assert result["conversation_messages"][2]["tool_call_id"] == "call-1"
-    assert synchronized[-1] == result["conversation_messages"]
+    with pytest.raises(ValueError, match="does not match alias"):
+        await bridge.invoke(
+            UserSimActivationRequest(
+                activation_id="activation-role-mismatch",
+                role="judge",
+                model_alias="assistant_model",
+                messages=[{"role": "user", "content": "Respond as the assistant."}],
+                parameters={},
+            )
+        )
+
+    assert client.calls == []
 
 
-async def test_usersim_environment_server_runs_native_episode(monkeypatch) -> None:
+async def test_usersim_environment_server_runs_native_episode() -> None:
     environment_server, client = _environment_server()
     _queue_success_responses(client)
-
-    async def fake_run(bridge, _scenario):
-        await bridge.invoke("user_model", [{"role": "user", "content": "write user"}], max_tokens=None, tools=None)
-        await bridge.invoke(
-            "assistant_model",
-            [{"role": "user", "content": "I need dinner advice."}],
-            max_tokens=128,
-            tools=None,
-        )
-        await bridge.invoke(
-            "judge_model",
-            [{"role": "user", "content": "judge"}],
-            max_tokens=None,
-            tools=None,
-        )
-        await bridge.invoke(
-            "summary_model",
-            [{"role": "user", "content": "summarize"}],
-            max_tokens=None,
-            tools=None,
-        )
-        return {
-            "conversation_messages": [
-                {"role": "user", "content": "I need dinner advice."},
-                {"role": "assistant", "content": "Try a lentil curry."},
-            ],
-            "conversation_status": True,
-            "simulation_outcome": {"status": "ok", "early_stop": True},
-            "simulation_traces": [],
-        }
-
-    monkeypatch.setattr(environment_server, "_run_usersim", fake_run)
     response = await environment_server.run_request(_request())
 
     assert isinstance(environment_server, BaseEnvironmentServer)
@@ -472,15 +461,23 @@ async def test_usersim_environment_server_runs_native_episode(monkeypatch) -> No
     assert response.result.verification.reward == 1.0
     assert [invocation.role for invocation in response.result.invocations] == ["user", "assistant", "judge", "summary"]
     assert response.result.invocations[1].request.max_output_tokens == 128
+    assert response.result.invocations[1].request.temperature == 0.3
+    assert response.result.invocations[1].request.top_p == 0.9
+    assert response.result.invocations[1].response.usage.total_tokens == 15
     assert response.result.invocations[1].termination_reason == "usersim_early_stop"
     assert [path for _, path, _ in client.calls] == [
         "/seed_session",
         "/v1/agent_sessions",
         "/v1/agent_sessions",
+        "/runtime/start",
         "/ng-rollout/rollout-a2/v1/responses",
+        "/runtime/advance",
         "/ng-rollout/rollout-a2/v1/responses",
+        "/runtime/advance",
         "/v1/responses",
+        "/runtime/advance",
         "/v1/responses",
+        "/runtime/advance",
         "/v1/agent_sessions/close",
         "/v1/agent_sessions/close",
         "/verify",
@@ -490,13 +487,13 @@ async def test_usersim_environment_server_runs_native_episode(monkeypatch) -> No
     [tool_access] = client.calls[2][2]["json"]["tool_accesses"]
     assert tool_access["name"] == "resources.direct_http"
     assert tool_access["cookies"] == {"session": "resources-cookie"}
-    assert client.calls[3][2]["cookies"] == {"session": "user-cookie"}
-    assert client.calls[4][2]["cookies"] == {"session": "assistant-cookie"}
-    assert client.calls[5][0] == "support"
-    assert client.calls[6][0] == "support"
-    assert "cookies" not in client.calls[5][2]
-    assert "cookies" not in client.calls[6][2]
-    verify_body = client.calls[9][2]["json"]
+    assert client.calls[4][2]["cookies"] == {"session": "user-cookie"}
+    assert client.calls[6][2]["cookies"] == {"session": "assistant-cookie"}
+    assert client.calls[8][0] == "support"
+    assert client.calls[10][0] == "support"
+    assert "cookies" not in client.calls[8][2]
+    assert "cookies" not in client.calls[10][2]
+    verify_body = client.calls[14][2]["json"]
     assert verify_body.task_id == TaskId(taskset="usersim:example", task_id="task")
     assert [invocation.role for invocation in verify_body.verification_input.invocations] == [
         "user",
@@ -506,45 +503,14 @@ async def test_usersim_environment_server_runs_native_episode(monkeypatch) -> No
     ]
 
 
-async def test_token_capture_uses_environment_episode_identity(monkeypatch) -> None:
+async def test_token_capture_uses_environment_episode_identity() -> None:
     environment_server, client = _environment_server(token_capture=True)
     _queue_success_responses(client)
-
-    async def fake_run(bridge, _scenario):
-        await bridge.invoke("user_model", [{"role": "user", "content": "write user"}], max_tokens=None, tools=None)
-        await bridge.invoke(
-            "assistant_model",
-            [{"role": "user", "content": "hello"}],
-            max_tokens=None,
-            tools=None,
-        )
-        await bridge.invoke(
-            "judge_model",
-            [{"role": "user", "content": "judge"}],
-            max_tokens=None,
-            tools=None,
-        )
-        await bridge.invoke(
-            "summary_model",
-            [{"role": "user", "content": "summarize"}],
-            max_tokens=None,
-            tools=None,
-        )
-        return {
-            "conversation_messages": [
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": "answer"},
-            ],
-            "conversation_status": True,
-            "simulation_outcome": {},
-        }
-
-    monkeypatch.setattr(environment_server, "_run_usersim", fake_run)
     await environment_server.run_request(_request())
 
-    for call_index in (3, 4):
+    for call_index in (4, 6):
         assert client.calls[call_index][1] == "/ng-rollout/rollout-a2/training-token-capture/v1/responses"
-    for call_index in (5, 6):
+    for call_index in (8, 10):
         assert client.calls[call_index][1] == "/v1/responses"
 
 

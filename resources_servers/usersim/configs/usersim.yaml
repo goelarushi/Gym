@@ -2,9 +2,9 @@ environment_routing_mode: taskset
 environment_server_routes:
   "usersim:example": usersim_environment
 
-support_model_base_url: ${policy_base_url}
-support_model_api_key: ${policy_api_key}
-support_model_name: ${policy_model_name}
+support_model_base_url: ???
+support_model_api_key: ???
+support_model_name: ???
 support_model_uses_reasoning_parser: false
 
 policy_model:
@@ -96,18 +96,5 @@ usersim_environment:
         name: usersim_resources
       resources_tool_transports:
         - direct_http
-      max_turns: 6
       default_episode_timeout_seconds: 1800
       cleanup_timeout_seconds: 180
-      protocol_config:
-        max_query_attempts: 3
-        max_assistant_attempts: 1
-        enforce_user_language: true
-        user_language_min_script_compliance: 0.6
-        user_language_min_letters: 8
-        incremental_disclosure_ratio: 0.6
-        persona_grounding_ratio: 1.0
-        context_compression: false
-        compression_window: 1
-        store_reasoning: true
-        verbosity: 1

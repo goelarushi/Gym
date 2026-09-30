@@ -373,6 +373,11 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             if collect_trajectory and all_fn_calls:
                 turns[-1].step_count = len(tool_records)
 
+            if all_fn_calls and tool_loop_policy is not None and tool_loop_policy.tool_round_mode == "single":
+                force_synthesis = tool_loop_policy.final_synthesis_without_tools
+                if not force_synthesis:
+                    break
+
             if (
                 tool_loop_policy is not None
                 and tool_loop_policy.max_tool_calls_per_turn is not None

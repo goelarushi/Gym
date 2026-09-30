@@ -6,7 +6,7 @@
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from nemo_gym.base_resources_server import (
     ResourcesSeedSessionResponse,
@@ -34,30 +34,13 @@ class UserSimScenario(BaseModel):
     probe_data: dict[str, Any] = Field(default_factory=dict)
 
 
-class UserSimTheme(BaseModel):
-    """One selectable theme used to construct a scenario."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    topic: str = Field(min_length=1)
-    goal: str = Field(min_length=1)
-
-
-class UserSimSamplingRequest(BaseModel):
-    """Dataset-owned inputs used to select one replayable scenario."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    locale: str = Field("en_US", pattern=r"^[A-Za-z0-9_]+$")
-    seed: int
-    probe_type: str | None = None
-
-
 class UserSimProtocolConfig(BaseModel):
-    """Run-wide subset of ``ConversationSimulatorConfig`` owned by the Environment Server."""
+    """Run-wide ``ConversationSimulatorConfig`` behavior owned by Gym."""
 
     model_config = ConfigDict(extra="forbid")
 
+    max_tools: int = Field(5, ge=1)
+    max_steps: int = Field(10, ge=1)
     max_query_attempts: int = Field(3, ge=1)
     max_assistant_attempts: int = Field(1, ge=1)
     enforce_user_language: bool = True
@@ -68,17 +51,21 @@ class UserSimProtocolConfig(BaseModel):
     context_compression: bool = False
     compression_window: int = Field(1, ge=1)
     store_reasoning: bool = True
+    finance_tier_mix: float = Field(0.0, ge=0, le=1)
+    finance_tier: Literal["verifiable", "dynamic"] | None = None
+    finance_retrieval_mode: Literal["hybrid", "dense", "golden"] = "hybrid"
+    finance_embedding_model_alias: str = "embedding_model"
     random_seed: int | None = None
     verbosity: int = Field(1, ge=0, le=2)
 
 
 class UserSimTaskInput(BaseModel):
-    """Durable input loaded from one UserSim task row."""
+    """Fully resolved, provenance-pinned input loaded from one prepared task row."""
 
     model_config = ConfigDict(extra="forbid")
 
-    sampling: UserSimSamplingRequest
-    probe_data: dict[str, Any] = Field(default_factory=dict)
+    scenario: UserSimScenario
+    usersim_context: "ResolvedUserSimContext"
     responses_create_params: dict[UserSimAgentRole, NeMoGymResponseCreateParamsNonStreaming] = Field(
         default_factory=dict
     )
@@ -122,7 +109,7 @@ class UserTurnPolicySnapshot(BaseModel):
     followup_anchor: str | None
     allowed_phrases: list[str]
     script_check_ignores: list[str]
-    check_opening: Literal["none"]
+    check_opening: Literal["none", "native"]
 
 
 class ProbeRuntimeDescriptor(BaseModel):
@@ -152,36 +139,33 @@ class UserSimSeedResponse(ResourcesSeedSessionResponse):
     runtime_descriptor: ProbeRuntimeDescriptor | None = None
 
 
-class UserSimTranscriptSyncRequest(BaseModel):
-    """Synchronize the canonical transcript into the Resources-owned runtime."""
+class UserSimActivationRequest(BaseModel):
+    """One model activation requested by the Resources-owned native lifecycle."""
 
     model_config = ConfigDict(extra="forbid")
 
+    activation_id: str = Field(min_length=1)
+    role: UserSimAgentRole
+    model_alias: str = Field(min_length=1)
     messages: list[dict[str, Any]]
+    parameters: dict[str, Any]
+    assistant_tool_loop_policy: AssistantToolLoopPolicy | None = None
 
 
-class UserSimRuntimeTurnRequest(BaseModel):
-    """Identify one semantic outer conversation turn."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    turn_idx: int = Field(ge=1)
-
-
-class UserSimFollowupInstructionsResponse(BaseModel):
-    """Probe-authored additions for one user follow-up activation."""
+class UserSimActivationResult(BaseModel):
+    """One externally executed result submitted to the native lifecycle."""
 
     model_config = ConfigDict(extra="forbid")
 
-    instructions: list[str]
+    activation_id: str = Field(min_length=1)
+    response: dict[str, Any] | None = None
+    transcript_delta: list[dict[str, Any]] = Field(default_factory=list)
 
-
-class UserSimRuntimeBooleanResponse(BaseModel):
-    """Boolean result from a delegated runtime lifecycle hook."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    value: bool
+    @model_validator(mode="after")
+    def require_exactly_one_payload(self) -> "UserSimActivationResult":
+        if (self.response is None) == (not self.transcript_delta):
+            raise ValueError("exactly one of response or transcript_delta is required")
+        return self
 
 
 class UserSimSimulationResult(BaseModel):
@@ -205,6 +189,18 @@ class UserSimSimulationResult(BaseModel):
     @classmethod
     def decode_json_columns(cls, value: Any) -> Any:
         return json.loads(value) if isinstance(value, str) else value
+
+
+class UserSimEpisodeLifecycleComplete(BaseModel):
+    """Terminal event from the Resources-owned native lifecycle."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    complete: Literal[True] = True
+    result: UserSimSimulationResult
+
+
+UserSimLifecycleEvent = UserSimActivationRequest | UserSimEpisodeLifecycleComplete
 
 
 class UserSimInvocation(BaseModel):

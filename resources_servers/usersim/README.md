@@ -134,9 +134,10 @@ routes UserSim's Judge and Summary calls directly to `support_model`, without
 creating support Agent sessions. Resources-owned tool-result synthesis and
 native probe scoring retain the purpose-specific `tool_simulation_model` and
 `probe_scorer_model` configuration fields, but both reference the same support
-Model Server. Its endpoint settings default to the policy settings and can be
-overridden independently. `/close_session` removes the resolved scenario and
-mutable runtime state.
+Model Server. Policy and support endpoint settings are mandatory and remain
+distinct aliases even if explicitly configured to use the same capable
+upstream service. `/close_session` removes the resolved scenario and mutable
+runtime state.
 
 ## Static and dynamic configuration
 
@@ -200,8 +201,8 @@ are retained in `verifier_data`.
 
 ## Run
 
-Configure `policy_base_url`, `policy_api_key`, and `policy_model_name`, then
-prepare the UserSim panel before collecting rollouts:
+Configure the `policy_*` and explicit `support_model_*` endpoint settings,
+then prepare the UserSim panel and resolved tasks before collecting rollouts:
 
 ```bash
 gym eval prepare --config environments/usersim/config.yaml

@@ -537,7 +537,7 @@ class TestApp:
                 single_user_turn=False,
                 assistant_error_behavior="fail_episode",
                 tool_error_behavior="return_error_payload",
-                max_tool_calls_per_turn=1,
+                max_tool_calls_per_turn=None,
                 max_tool_response_attempts=1,
                 assistant_resampling=False,
             ),
@@ -545,6 +545,8 @@ class TestApp:
 
         assert [item.type for item in response.output] == [
             "function_call",
+            "function_call",
+            "function_call_output",
             "function_call_output",
             "message",
         ]
@@ -554,7 +556,13 @@ class TestApp:
             "X-NeMo-Gym-Turn-Index": "4",
             "X-NeMo-Gym-Call-Index": "0",
         }
-        final_request = server_client.post.await_args_list[2].kwargs["json"]
+        second_tool_call = server_client.post.await_args_list[2]
+        assert second_tool_call.kwargs["headers"] == {
+            "X-NeMo-Gym-Tool-Call-Id": "call-8",
+            "X-NeMo-Gym-Turn-Index": "4",
+            "X-NeMo-Gym-Call-Index": "1",
+        }
+        final_request = server_client.post.await_args_list[3].kwargs["json"]
         assert final_request.tools == []
         assert resource_cookies == {"resources-session": "updated-cookie"}
 

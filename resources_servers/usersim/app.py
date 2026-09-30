@@ -32,29 +32,27 @@ from nemo_gym.episode_types import (
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseFunctionToolCall,
     NeMoGymResponseOutputMessage,
+    NeMoGymResponseReasoningItem,
 )
 from nemo_gym.server_utils import SESSION_ID_KEY, get_response_json, raise_for_status
 from resources_servers.usersim.episode_contracts import (
     ProbeRuntimeDescriptor,
-    ResolvedUserSimContext,
-    UserSimFollowupInstructionsResponse,
-    UserSimRuntimeBooleanResponse,
-    UserSimRuntimeTurnRequest,
-    UserSimSamplingRequest,
+    UserSimActivationRequest,
+    UserSimActivationResult,
+    UserSimEpisodeLifecycleComplete,
+    UserSimLifecycleEvent,
+    UserSimProtocolConfig,
     UserSimScenario,
     UserSimSeedResponse,
     UserSimSimulationResult,
     UserSimTaskInput,
-    UserSimTheme,
-    UserSimTranscriptSyncRequest,
     UserSimVerification,
     UserSimVerifyRequest,
 )
 
 
-TOOL_PROBES = frozenset({"tool_calling", "safety_agentic", "financial_services"})
-THEME_DRIVEN_PROBES = frozenset({"tool_calling", "general_open_ended", "general_educational"})
 PROBE_SCORERS = {
     "financial_services": "financial_services",
     "health_decision_support_disclosure": "health_disclosure_concealment",
@@ -102,31 +100,11 @@ class UserSimResourcesServerConfig(BaseResourcesServerConfig):
     tool_simulation_model: ModelServerRef | None = None
     probe_scorer_model: ModelServerRef | None = None
     model_call_timeout_seconds: float = Field(300.0, gt=0)
-    probe_mix: dict[str, float] = Field(
-        default_factory=lambda: {
-            "general_open_ended": 0.5,
-            "general_educational": 0.5,
-        }
-    )
-    probe_themes: dict[str, list[UserSimTheme]] = Field(
-        default_factory=lambda: {
-            "general_open_ended": [
-                UserSimTheme(
-                    topic="local food and dining",
-                    goal="Seek a practical recommendation about local food and dining.",
-                )
-            ],
-            "general_educational": [
-                UserSimTheme(
-                    topic="local ecology",
-                    goal="Learn about local ecology by asking focused follow-up questions.",
-                )
-            ],
-        }
-    )
+    max_turns: int = Field(5, ge=1)
+    protocol_config: UserSimProtocolConfig = Field(default_factory=UserSimProtocolConfig)
 
     @model_validator(mode="after")
-    def validate_probes(self) -> "UserSimResourcesServerConfig":
+    def validate_locales(self) -> "UserSimResourcesServerConfig":
         if not self.personas_locales:
             raise ValueError("personas_locales must contain at least one locale")
         invalid_locales = [locale for locale in self.personas_locales if not locale.replace("_", "").isalnum()]
@@ -134,26 +112,13 @@ class UserSimResourcesServerConfig(BaseResourcesServerConfig):
             raise ValueError(f"Invalid persona locales: {invalid_locales}")
         if len(set(self.personas_locales)) != len(self.personas_locales):
             raise ValueError("personas_locales must not contain duplicates")
-        unknown = set(self.probe_mix) - SUPPORTED_PROBES
-        if unknown:
-            raise ValueError(f"Unsupported probe types: {sorted(unknown)}")
-        if not self.probe_mix or any(weight < 0 for weight in self.probe_mix.values()):
-            raise ValueError("probe_mix must contain non-negative weights")
-        if sum(self.probe_mix.values()) <= 0:
-            raise ValueError("probe_mix weights must sum to more than zero")
-        missing_themes = {
-            probe
-            for probe, weight in self.probe_mix.items()
-            if probe in THEME_DRIVEN_PROBES and weight > 0 and not self.probe_themes.get(probe)
-        }
-        if missing_themes:
-            raise ValueError(f"Missing themes for probe types: {sorted(missing_themes)}")
         return self
 
 
 class PreparedPersonaDataset(BaseModel):
     locale: str
     personas_dataset_version: str
+    usersim_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     panel_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     panel_size_bytes: int = Field(ge=1)
     panel_rows: int
@@ -167,16 +132,6 @@ class SeededUserSimEpisode(BaseModel):
     task_id: TaskId
     seed: UserSimSeedResponse
     runtime: Any | None = None
-
-
-def _stable_fraction(*parts: Any) -> float:
-    digest = hashlib.sha256(":".join(str(part) for part in parts).encode()).digest()
-    return int.from_bytes(digest, "big") / (1 << (8 * len(digest)))
-
-
-def _stable_index(size: int, *parts: Any) -> int:
-    digest = hashlib.sha256(":".join(str(part) for part in parts).encode()).digest()
-    return int.from_bytes(digest, "big") % size
 
 
 def _sha256_file(path: Path) -> str:
@@ -231,17 +186,23 @@ class _ResourcesModelFacade:
         self.model_name = model.name
 
     async def acompletion(self, messages: Sequence[Any], **kwargs: Any) -> SimpleNamespace:
-        unsupported = set(kwargs) - {"max_tokens", "max_completion_tokens", "response_format"}
+        supported = {
+            "max_tokens",
+            "max_completion_tokens",
+            "parallel_tool_calls",
+            "reasoning_effort",
+            "response_format",
+            "temperature",
+            "tool_choice",
+            "tools",
+            "top_p",
+        }
+        unsupported = set(kwargs) - supported
         if unsupported:
             raise NotImplementedError(f"Unsupported UserSim support-model options: {sorted(unsupported)}")
-        max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
         try:
             async with asyncio.timeout(self.server.config.model_call_timeout_seconds):
-                return await self._completion(
-                    messages,
-                    max_tokens=max_tokens,
-                    response_format=kwargs.get("response_format"),
-                )
+                return await self._completion(messages, options=kwargs)
         except TimeoutError as error:
             raise TimeoutError(
                 f"Timed out after {self.server.config.model_call_timeout_seconds}s waiting for {self.model.name}"
@@ -251,12 +212,22 @@ class _ResourcesModelFacade:
         self,
         messages: Sequence[Any],
         *,
-        max_tokens: int | None,
-        response_format: Mapping[str, Any] | None,
+        options: Mapping[str, Any],
     ) -> SimpleNamespace:
-        params: dict[str, Any] = {"input": [_to_responses_input(message) for message in messages]}
+        params: dict[str, Any] = {
+            "input": [item for message in messages for item in _to_responses_input_items(message)]
+        }
+        max_tokens = options.get("max_tokens") or options.get("max_completion_tokens")
         if max_tokens is not None:
             params["max_output_tokens"] = max_tokens
+        for name in ("parallel_tool_calls", "temperature", "tool_choice", "top_p"):
+            if options.get(name) is not None:
+                params[name] = options[name]
+        if options.get("reasoning_effort") is not None:
+            params["reasoning"] = {"effort": options["reasoning_effort"]}
+        if options.get("tools"):
+            params["tools"] = [_to_responses_tool(tool) for tool in options["tools"]]
+        response_format = options.get("response_format")
         if response_format is not None:
             json_schema = response_format.get("json_schema")
             if response_format.get("type") != "json_schema" or not isinstance(json_schema, Mapping):
@@ -278,12 +249,12 @@ class _ResourcesModelFacade:
         gym_response = NeMoGymResponse.model_validate(await get_response_json(response))
         usage = gym_response.usage
         return SimpleNamespace(
-            message=SimpleNamespace(content=_response_text(gym_response), reasoning_content=None, tool_calls=None),
-            usage=(
-                SimpleNamespace(input_tokens=usage.input_tokens, output_tokens=usage.output_tokens)
-                if usage is not None
-                else None
+            message=SimpleNamespace(
+                content=_response_text(gym_response),
+                reasoning_content=_response_reasoning(gym_response) or None,
+                tool_calls=_response_tool_calls(gym_response) or None,
             ),
+            usage=SimpleNamespace(**usage.model_dump(mode="python")) if usage is not None else None,
         )
 
 
@@ -304,9 +275,8 @@ class UserSimResourcesServer(SimpleResourcesServer):
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
-        app.post("/runtime/transcript")(self.synchronize_runtime_transcript)
-        app.post("/runtime/followup_instructions")(self.runtime_followup_instructions)
-        app.post("/runtime/capitulation")(self.runtime_capitulation)
+        app.post("/runtime/start", response_model=UserSimLifecycleEvent)(self.start_runtime_lifecycle)
+        app.post("/runtime/advance", response_model=UserSimLifecycleEvent)(self.advance_runtime_lifecycle)
         app.post("/{tool_name}")(self.invoke_probe_tool)
         return app
 
@@ -358,51 +328,34 @@ class UserSimResourcesServer(SimpleResourcesServer):
             )
         return personas
 
-    def _select_probe(self, sampling: UserSimSamplingRequest) -> str:
-        if sampling.probe_type is not None:
-            if sampling.probe_type not in SUPPORTED_PROBES:
-                raise HTTPException(status_code=422, detail=f"Unsupported probe type: {sampling.probe_type!r}")
-            return sampling.probe_type
-        threshold = _stable_fraction(sampling.seed, sampling.locale, "probe")
-        total = sum(self.config.probe_mix.values())
-        cumulative = 0.0
-        for probe, weight in self.config.probe_mix.items():
-            cumulative += weight / total
-            if threshold < cumulative:
-                return probe
-        return next(reversed(self.config.probe_mix))
-
-    def _resolve_seed(self, sampling: UserSimSamplingRequest, resources_session_id: str) -> UserSimSeedResponse:
-        personas = self._load_personas(sampling.locale)
-        dataset = self.locale_to_dataset[sampling.locale]
-        persona = personas[_stable_index(len(personas), sampling.seed, sampling.locale, "persona")]
-        probe_type = self._select_probe(sampling)
-        themes = self.config.probe_themes.get(probe_type) or [
-            UserSimTheme(
-                topic=probe_type.replace("_", " "),
-                goal=f"Run the {probe_type} UserSim probe.",
+    def _resolve_seed(self, task: UserSimTaskInput, resources_session_id: str) -> UserSimSeedResponse:
+        scenario = task.scenario
+        context = task.usersim_context
+        personas = self._load_personas(scenario.locale)
+        dataset = self.locale_to_dataset[scenario.locale]
+        if context.locale != scenario.locale:
+            raise HTTPException(status_code=422, detail="Resolved UserSim context locale does not match scenario")
+        if context.personas_dataset_version != dataset.personas_dataset_version:
+            raise HTTPException(status_code=422, detail="Resolved UserSim task uses a different persona panel version")
+        if context.personas_panel_sha256 != dataset.panel_sha256:
+            raise HTTPException(
+                status_code=422, detail="Resolved UserSim task uses a different persona panel checksum"
             )
-        ]
-        theme = themes[_stable_index(len(themes), sampling.seed, sampling.locale, probe_type, "theme")]
+        if (
+            context.usersim_revision != self.config.usersim_revision
+            or context.usersim_revision != dataset.usersim_revision
+        ):
+            raise HTTPException(status_code=422, detail="Resolved UserSim task uses a different UserSim revision")
+        if scenario.probe_type not in SUPPORTED_PROBES:
+            raise HTTPException(status_code=422, detail=f"Unsupported probe type: {scenario.probe_type!r}")
+        if scenario.persona not in personas:
+            raise HTTPException(
+                status_code=422, detail="Resolved UserSim persona is not present in the prepared panel"
+            )
         return UserSimSeedResponse(
             resources_session_id=resources_session_id,
-            scenario=UserSimScenario(
-                locale=sampling.locale,
-                persona=persona,
-                probe_type=probe_type,
-                theme={
-                    "type": theme.topic,
-                    "description": theme.goal,
-                },
-                goal=theme.goal,
-            ),
-            usersim_context=ResolvedUserSimContext(
-                locale=sampling.locale,
-                seed=sampling.seed,
-                personas_dataset_version=dataset.personas_dataset_version,
-                personas_panel_sha256=dataset.panel_sha256,
-                usersim_revision=self.config.usersim_revision,
-            ),
+            scenario=scenario,
+            usersim_context=context,
         )
 
     def _seeded_episode(self, request: Request) -> SeededUserSimEpisode:
@@ -421,26 +374,21 @@ class UserSimResourcesServer(SimpleResourcesServer):
         except ValidationError as error:
             raise HTTPException(status_code=422, detail=error.errors()) from error
         session_id = request.session[SESSION_ID_KEY]
-        result = self._resolve_seed(task.sampling, body.resources_session_id)
-        result = result.model_copy(
-            update={"scenario": result.scenario.model_copy(update={"probe_data": task.probe_data})}
-        )
-        runtime = None
-        if result.scenario.probe_type in TOOL_PROBES:
-            runtime = self._create_probe_runtime(result.scenario, task)
-            descriptor = ProbeRuntimeDescriptor.model_validate((await runtime.descriptor()).to_dict())
-            scenario = result.scenario
-            if scenario.probe_type == "tool_calling":
-                scenario = scenario.model_copy(
-                    update={"probe_data": {**scenario.probe_data, "tools": descriptor.assistant_tools}}
-                )
-            result = result.model_copy(
-                update={
-                    "scenario": scenario,
-                    "assistant_tools": descriptor.assistant_tools,
-                    "runtime_descriptor": descriptor,
-                }
+        result = self._resolve_seed(task, body.resources_session_id)
+        runtime = self._create_probe_runtime(result.scenario, task)
+        descriptor = ProbeRuntimeDescriptor.model_validate((await runtime.descriptor()).to_dict())
+        scenario = result.scenario
+        if scenario.probe_type == "tool_calling":
+            scenario = scenario.model_copy(
+                update={"probe_data": {**scenario.probe_data, "tools": descriptor.assistant_tools}}
             )
+        result = result.model_copy(
+            update={
+                "scenario": scenario,
+                "assistant_tools": descriptor.assistant_tools,
+                "runtime_descriptor": descriptor,
+            }
+        )
         self.session_id_to_seed[session_id] = SeededUserSimEpisode(
             episode_id=body.episode_id,
             task_id=body.task_id,
@@ -466,24 +414,23 @@ class UserSimResourcesServer(SimpleResourcesServer):
                 self,
                 self.config.tool_simulation_model,
             )
-        if self.config.probe_scorer_model is not None:
-            models["judge_model"] = _ResourcesModelFacade(
-                self,
-                self.config.probe_scorer_model,
-            )
         data = {
-            **task.probe_data,
+            **scenario.probe_data,
             "persona": scenario.persona,
             "probe_type": scenario.probe_type,
             "theme": scenario.theme,
         }
-        config = ConversationSimulatorConfig(
-            name="gym_probe_episode_runtime",
-            locale=scenario.locale,
-            random_seed=task.sampling.seed,
-            tools_column="tools" if scenario.probe_type == "tool_calling" else None,
-            finance_retrieval_mode="golden",
+        config_values = self.config.protocol_config.model_dump(mode="python", exclude_none=True)
+        config_values.update(
+            {
+                "name": "gym_probe_episode_runtime",
+                "locale": scenario.locale,
+                "max_turns": self.config.max_turns,
+                "random_seed": task.usersim_context.seed,
+                "tools_column": "tools" if scenario.probe_type == "tool_calling" else None,
+            }
         )
+        config = ConversationSimulatorConfig.model_validate(config_values)
         return ProbeEpisodeRuntime(
             probe_type=scenario.probe_type,
             persona=scenario.persona,
@@ -518,17 +465,14 @@ class UserSimResourcesServer(SimpleResourcesServer):
             "persona": scenario.persona,
             "probe_type": scenario.probe_type,
         }
-        if seeded.runtime is not None:
-            scorer_models = {alias: model for alias, model in seeded.runtime.models.items() if alias == "judge_model"}
-        elif self.config.probe_scorer_model is not None:
+        scorer_models = {alias: model for alias, model in seeded.runtime.models.items() if alias == "judge_model"}
+        if not scorer_models and self.config.probe_scorer_model is not None:
             scorer_models = {
                 "judge_model": _ResourcesModelFacade(
                     self,
                     self.config.probe_scorer_model,
                 )
             }
-        else:
-            scorer_models = {}
 
         try:
             from usersim.engine.evaluator.scorers import get_scorer
@@ -628,40 +572,30 @@ class UserSimResourcesServer(SimpleResourcesServer):
         except json.JSONDecodeError:
             return {"result": payload}
 
-    async def synchronize_runtime_transcript(
+    async def start_runtime_lifecycle(
         self,
         request: Request,
-        body: UserSimTranscriptSyncRequest,
-    ) -> UserSimRuntimeBooleanResponse:
-        """Synchronize the canonical transcript into the one owned runtime."""
+    ) -> UserSimLifecycleEvent:
+        """Start the canonical lifecycle and return its first activation."""
         seeded = self._seeded_episode(request)
-        if seeded.runtime is None:
-            raise HTTPException(status_code=404, detail="This episode has no external probe runtime")
-        await seeded.runtime.synchronize_transcript(body.messages)
-        return UserSimRuntimeBooleanResponse(value=True)
+        try:
+            event = await seeded.runtime.advance()
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return _lifecycle_event(event)
 
-    async def runtime_followup_instructions(
+    async def advance_runtime_lifecycle(
         self,
         request: Request,
-        body: UserSimRuntimeTurnRequest,
-    ) -> UserSimFollowupInstructionsResponse:
-        """Delegate probe-specific follow-up instructions to the owned runtime."""
+        body: UserSimActivationResult,
+    ) -> UserSimLifecycleEvent:
+        """Submit one activation result and return the next lifecycle event."""
         seeded = self._seeded_episode(request)
-        if seeded.runtime is None:
-            raise HTTPException(status_code=404, detail="This episode has no external probe runtime")
-        return UserSimFollowupInstructionsResponse(
-            instructions=await seeded.runtime.format_followup_user_instructions(body.turn_idx)
-        )
-
-    async def runtime_capitulation(
-        self,
-        request: Request,
-    ) -> UserSimRuntimeBooleanResponse:
-        """Run the probe-specific stop hook over synchronized state."""
-        seeded = self._seeded_episode(request)
-        if seeded.runtime is None:
-            raise HTTPException(status_code=404, detail="This episode has no external probe runtime")
-        return UserSimRuntimeBooleanResponse(value=await seeded.runtime.is_capitulation_detected())
+        try:
+            event = await seeded.runtime.advance(body.model_dump(mode="json"))
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return _lifecycle_event(event)
 
     async def verify(
         self,
@@ -681,7 +615,7 @@ class UserSimResourcesServer(SimpleResourcesServer):
                 detail="Verified NeMo UserSim resolved episode does not match the seeded session",
             )
         native_result = verification_input.usersim_result
-        if seeded.runtime is not None:
+        if getattr(seeded.runtime, "_lifecycle_started", False):
             native_result = UserSimSimulationResult.model_validate(await seeded.runtime.finalize())
         native_scorer_name, native_scores, native_scorer_pass = await self._score_native_result(
             seeded,
@@ -748,11 +682,22 @@ class UserSimResourcesServer(SimpleResourcesServer):
         seeded = self._seeded_episode(request)
         if body.resources_session_id != seeded.seed.resources_session_id or body.episode_id != seeded.episode_id:
             raise HTTPException(status_code=409, detail="Resources session does not match the active episode")
+        lifecycle_task = getattr(seeded.runtime, "_lifecycle_task", None)
+        if isinstance(lifecycle_task, asyncio.Task) and not lifecycle_task.done():
+            lifecycle_task.cancel()
+            await asyncio.gather(lifecycle_task, return_exceptions=True)
         del self.session_id_to_seed[session_id]
         return ResourcesCloseSessionResponse(resources_session_id=body.resources_session_id)
 
 
-def _to_responses_input(message: Any) -> dict[str, Any]:
+def _lifecycle_event(event: Any) -> UserSimLifecycleEvent:
+    value = event.to_dict()
+    if value.get("complete") is True:
+        return UserSimEpisodeLifecycleComplete.model_validate(value)
+    return UserSimActivationRequest.model_validate(value)
+
+
+def _to_responses_input_items(message: Any) -> list[dict[str, Any]]:
     if hasattr(message, "model_dump"):
         value = message.model_dump(mode="json", exclude_none=True)
     elif isinstance(message, Mapping):
@@ -760,7 +705,55 @@ def _to_responses_input(message: Any) -> dict[str, Any]:
     else:
         value = {"role": getattr(message, "role"), "content": getattr(message, "content", "")}
     role = getattr(value.get("role"), "value", value.get("role"))
-    return {"type": "message", "role": role, "content": value.get("content", "")}
+    if role == "tool":
+        return [
+            {
+                "type": "function_call_output",
+                "call_id": value["tool_call_id"],
+                "output": value.get("content", ""),
+            }
+        ]
+    if role == "assistant" and value.get("tool_calls"):
+        items = []
+        if value.get("content"):
+            items.append({"type": "message", "role": role, "content": value["content"]})
+        for call in value["tool_calls"]:
+            call = call.model_dump(mode="json", exclude_none=True) if hasattr(call, "model_dump") else dict(call)
+            function = call.get("function")
+            if isinstance(function, Mapping):
+                name = function["name"]
+                arguments = function.get("arguments", "{}")
+            elif call.get("name"):
+                name = call["name"]
+                arguments = call.get("arguments_json", call.get("arguments", "{}"))
+            else:
+                raise ValueError("Assistant tool call must contain a function mapping")
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": name,
+                    "arguments": arguments,
+                }
+            )
+        return items
+    return [{"type": "message", "role": role, "content": value.get("content", "")}]
+
+
+def _to_responses_tool(tool: Any) -> dict[str, Any]:
+    value = tool.model_dump(mode="json", exclude_none=True) if hasattr(tool, "model_dump") else dict(tool)
+    function = value.get("function")
+    if isinstance(function, Mapping):
+        value = dict(function)
+    if not value.get("name"):
+        raise ValueError(f"Invalid UserSim function tool schema: {value!r}")
+    return {
+        "type": "function",
+        "name": value["name"],
+        "description": value.get("description"),
+        "parameters": value.get("parameters", {}),
+        "strict": value.get("strict", False),
+    }
 
 
 def _output_message_text(message: NeMoGymResponseOutputMessage) -> str:
@@ -779,6 +772,28 @@ def _response_text(response: NeMoGymResponse) -> str:
         if isinstance(item, NeMoGymResponseOutputMessage)
         if (text := _output_message_text(item))
     )
+
+
+def _response_reasoning(response: NeMoGymResponse) -> str:
+    return "\n".join(
+        part.text
+        for item in response.output
+        if isinstance(item, NeMoGymResponseReasoningItem)
+        for part in [*item.summary, *(item.content or [])]
+        if getattr(part, "text", None)
+    )
+
+
+def _response_tool_calls(response: NeMoGymResponse) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": item.call_id,
+            "type": "function",
+            "function": {"name": item.name, "arguments": item.arguments},
+        }
+        for item in response.output
+        if isinstance(item, NeMoGymResponseFunctionToolCall)
+    ]
 
 
 if __name__ == "__main__":
