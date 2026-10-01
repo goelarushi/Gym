@@ -11,7 +11,7 @@ from nemo_gym.server_utils import ServerClient
 from resources_servers.usersim.app import UserSimResourcesServer, UserSimResourcesServerConfig
 
 
-USERSIM_REVISION = "a4665b3ce1a030e83871232e2fb69e5b39480818"
+USERSIM_REVISION = "a4665b3ce1a030e83871232e2fb69e5b39480818"  # pragma: allowlist secret
 
 
 def _resolved_row(probe_type: str = "safety_agentic") -> dict:

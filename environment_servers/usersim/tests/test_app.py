@@ -269,7 +269,7 @@ def _request() -> UserSimEpisodeRequest:
                     "locale": "en_US",
                     "trajectory_id": "native-trajectory",
                     "usersim_provenance": {
-                        "code_sha": "a4665b3ce1a030e83871232e2fb69e5b39480818",
+                        "code_sha": "a4665b3ce1a030e83871232e2fb69e5b39480818",  # pragma: allowlist secret
                     },
                     "usersim_config": {"random_seed": 42},
                 },
@@ -299,7 +299,7 @@ def _queue_success_responses(client: _Client) -> None:
                         "locale": "en_US",
                         "trajectory_id": "native-trajectory",
                         "usersim_provenance": {
-                            "code_sha": "a4665b3ce1a030e83871232e2fb69e5b39480818",
+                            "code_sha": "a4665b3ce1a030e83871232e2fb69e5b39480818",  # pragma: allowlist secret
                         },
                         "usersim_config": {"random_seed": 42},
                     },

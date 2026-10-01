@@ -40,7 +40,7 @@ from resources_servers.usersim.episode_contracts import (
 from responses_api_agents.simple_agent.app import TOOL_CALL_ID_HEADER, SimpleAgent, SimpleAgentConfig
 
 
-USERSIM_REVISION = "a4665b3ce1a030e83871232e2fb69e5b39480818"
+USERSIM_REVISION = "a4665b3ce1a030e83871232e2fb69e5b39480818"  # pragma: allowlist secret
 
 
 def _message_value(message: Any, name: str, default: Any = None) -> Any:

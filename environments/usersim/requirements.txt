@@ -3,4 +3,4 @@
 
 # Preparation-only dependency. Keep this revision aligned with the UserSim
 # requirements used by the runtime servers.
-nemo-usersim @ git+ssh://git@github.com/NVIDIA-NeMo/UserSim.git@a4665b3ce1a030e83871232e2fb69e5b39480818
+nemo-usersim @ git+ssh://git@github.com/NVIDIA-NeMo/UserSim.git@a4665b3ce1a030e83871232e2fb69e5b39480818  # pragma: allowlist secret
