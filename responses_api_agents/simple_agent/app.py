@@ -34,7 +34,6 @@ from nemo_gym.base_responses_api_agent import (
     AgentCloseSessionResponse,
     AgentSeedSessionRequest,
     AgentSeedSessionResponse,
-    AgentToolLoopPolicy,
     BaseResponsesAPIAgentConfig,
     Body,
     SimpleResponsesAPIAgent,
@@ -69,6 +68,42 @@ _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
 TOOL_CALL_ID_HEADER = "X-NeMo-Gym-Tool-Call-Id"
 
 
+def _chat_message_from_response(response: NeMoGymResponse) -> dict[str, Any]:
+    """Flatten one Responses output into an OpenAI-style assistant message.
+
+    Reasoning is carried, not dropped: a caller that stores it has no other
+    way to see what the model thought on this step.
+    """
+    text: list[str] = []
+    reasoning: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for item in response.output:
+        if item.type == "message":
+            for content in item.content:
+                chunk = getattr(content, "text", None) or getattr(content, "refusal", None)
+                if chunk:
+                    text.append(chunk)
+        elif item.type == "reasoning":
+            for part in [*item.summary, *(item.content or [])]:
+                chunk = getattr(part, "text", None)
+                if chunk:
+                    reasoning.append(chunk)
+        elif item.type == "function_call":
+            tool_calls.append(
+                {
+                    "id": item.call_id,
+                    "type": "function",
+                    "function": {"name": item.name, "arguments": item.arguments},
+                }
+            )
+    message: dict[str, Any] = {"role": "assistant", "content": "\n".join(text)}
+    if reasoning:
+        message["reasoning_content"] = "\n".join(reasoning)
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
 def _merge_cookie_values(current: Mapping[str, str] | None, updates: Mapping[str, Any]) -> dict[str, str]:
     """Merge aiohttp response morsels into a JSON-safe cookie mapping."""
     merged = dict(current or {})
@@ -100,8 +135,7 @@ class _SimpleAgentSession:
     episode_id: Any
     task_id: Any
     resources_cookies: dict[str, str]
-    tool_batch_path: str | None = None
-    tool_loop_policy: AgentToolLoopPolicy | None = None
+    record_outputs_path: str | None = None
     trajectories: list[TrajectoryRecord] = field(default_factory=list)
 
 
@@ -130,8 +164,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             episode_id=body.episode_id,
             task_id=body.task_id,
             resources_cookies=resources_cookies,
-            tool_batch_path=direct_accesses[0].batch_path if direct_accesses else None,
-            tool_loop_policy=body.tool_loop_policy,
+            record_outputs_path=body.record_outputs_path,
         )
         return AgentSeedSessionResponse(agent_session_id=body.agent_session_id)
 
@@ -176,8 +209,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         rollout_id: str = "unscoped",
         collect_trajectory: bool = False,
         invocation_id: str = "root",
-        tool_loop_policy: AgentToolLoopPolicy | None = None,
-        tool_batch_path: str | None = None,
+        record_outputs_path: str | None = None,
     ) -> tuple[NeMoGymResponse, TrajectoryRecord | None, Any, Any]:
         tool_records: list[TrajectoryToolCall] = []
         model_calls: list[ModelCallRef] = []
@@ -193,19 +225,17 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         step = 0
         invocation_status = "completed"
         model_server_cookies = None
-        executed_call_count = 0
-        force_synthesis = False
+        # When the caller supplies the next input, it replaces this Agent's own
+        # accumulated transcript: the two diverge for callers that trim their
+        # context, and the caller's is the one its own loop will score.
+        supplied_input: list[Any] | None = None
 
         while True:
             step += 1
-            new_body = body.model_copy(update={"input": body.input + new_outputs})
-            final_synthesis_step = (
-                tool_loop_policy is not None
-                and tool_loop_policy.final_synthesis_without_tools
-                and (force_synthesis or step == tool_loop_policy.max_assistant_activations)
-            )
-            if final_synthesis_step:
-                new_body = new_body.model_copy(update={"tools": [], "tool_choice": "auto"})
+            if supplied_input is None:
+                new_body = body.model_copy(update={"input": body.input + new_outputs})
+            else:
+                new_body = body.model_copy(update={"input": supplied_input})
             if collect_trajectory:
                 turn_timestamp = time()
 
@@ -227,20 +257,6 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 ) from e
 
             output = model_response.output
-            tool_call_cap_reached = False
-            if tool_loop_policy is not None and tool_loop_policy.max_tool_calls_per_turn is not None:
-                remaining_calls = max(tool_loop_policy.max_tool_calls_per_turn - executed_call_count, 0)
-                filtered_output = []
-                for item in output:
-                    if item.type != "function_call":
-                        filtered_output.append(item)
-                    elif remaining_calls > 0:
-                        filtered_output.append(item)
-                        remaining_calls -= 1
-                    else:
-                        tool_call_cap_reached = True
-                output = filtered_output
-                model_response.output = output
             new_outputs.extend(output)
             if collect_trajectory:
                 turn_model_calls = []
@@ -282,9 +298,6 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             all_output_messages: List[NeMoGymResponseOutputMessage] = [
                 o for o in output if o.type == "message" and o.role == "assistant"
             ]
-            if final_synthesis_step and all_fn_calls:
-                invocation_status = "incomplete"
-                break
             if not all_fn_calls:
                 if not all_output_messages:
                     invocation_status = "incomplete"
@@ -311,7 +324,23 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         rollout_id,
                         step,
                     )
+                if record_outputs_path is not None:
+                    record, resources_server_cookies = await self._record_outputs(
+                        record_outputs_path,
+                        model_response,
+                        resources_server_cookies,
+                    )
+                    if not record["should_continue"]:
+                        break
                 break
+
+            record = None
+            if record_outputs_path is not None:
+                record, resources_server_cookies = await self._record_outputs(
+                    record_outputs_path,
+                    model_response,
+                    resources_server_cookies,
+                )
 
             parsed_calls: list[tuple[NeMoGymResponseFunctionToolCall, dict[str, Any]]] = []
             parse_errors: dict[str, str] = {}
@@ -323,31 +352,13 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         {"error": f"Invalid tool call arguments: {error!r}"}
                     )
 
-            batch_outputs: dict[str, str] = {}
-            if tool_batch_path is not None and len(parsed_calls) > 1:
-                batch_response = await self.server_client.post(
-                    server_name=self.config.resources_server.name,
-                    url_path=tool_batch_path,
-                    json=[
-                        {
-                            "tool_call_id": call.call_id,
-                            "tool_name": call.name,
-                            "arguments": arguments,
-                        }
-                        for call, arguments in parsed_calls
-                    ],
-                    cookies=resources_server_cookies,
-                )
-                payloads = await get_response_json(batch_response)
-                if not isinstance(payloads, list) or len(payloads) != len(parsed_calls):
-                    raise RuntimeError("Resources tool batch returned an invalid payload list")
-                batch_outputs = {
-                    call.call_id: str(payload) for (call, _), payload in zip(parsed_calls, payloads, strict=True)
-                }
-                resources_server_cookies = _merge_cookie_values(resources_server_cookies, batch_response.cookies)
+            # A caller that records may decline a call its own loop capped;
+            # asking for its payload would be asking for one that never ran.
+            runnable_call_ids = set(record["executed_tool_call_ids"]) if record is not None else None
 
             for output_function_call in all_fn_calls:
-                executed_call_count += 1
+                if runnable_call_ids is not None and output_function_call.call_id not in runnable_call_ids:
+                    continue
                 if collect_trajectory:
                     started_at = time()
                     started_monotonic = perf_counter()
@@ -356,12 +367,6 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     if collect_trajectory:
                         error_type = "invalid_arguments"
                         tool_status = "failed"
-                elif output_function_call.call_id in batch_outputs:
-                    tool_output = batch_outputs[output_function_call.call_id]
-                    if collect_trajectory:
-                        completed = 200 <= batch_response.status < 400
-                        tool_status = "completed" if completed else "failed"
-                        error_type = None if completed else f"http_{batch_response.status}"
                 else:
                     parsed_arguments = next(
                         arguments for call, arguments in parsed_calls if call.call_id == output_function_call.call_id
@@ -408,23 +413,23 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             if collect_trajectory and all_fn_calls:
                 turns[-1].step_count = len(tool_records)
 
-            if all_fn_calls and tool_loop_policy is not None and tool_loop_policy.tool_round_mode == "single":
-                force_synthesis = tool_loop_policy.final_synthesis_without_tools
-                if not force_synthesis:
+            if record is not None:
+                # The caller's loop decides what happens next, not this Agent:
+                # continue only while it says the turn is still going, and send
+                # exactly the input and tools it supplied.
+                if not record["should_continue"]:
                     break
-
-            if (
-                tool_loop_policy is not None
-                and tool_loop_policy.max_tool_calls_per_turn is not None
-                and executed_call_count >= tool_loop_policy.max_tool_calls_per_turn
-            ):
-                tool_call_cap_reached = True
-            if tool_call_cap_reached and tool_loop_policy is not None:
-                force_synthesis = tool_loop_policy.final_synthesis_without_tools
-
-            if tool_loop_policy is not None and step >= tool_loop_policy.max_assistant_activations:
-                invocation_status = "incomplete"
-                break
+                # Validate rather than model_copy: the caller's items arrive as
+                # plain JSON, and an unvalidated copy would leave them as dicts
+                # for the model server to choke on.
+                body = NeMoGymResponseCreateParamsNonStreaming.model_validate(
+                    {
+                        **body.model_dump(mode="json", exclude_unset=True),
+                        "input": record["input"],
+                        "tools": record["tools"],
+                    }
+                )
+                supplied_input = list(body.input)
 
             # Check if max steps is not None and if we have exhausted it.
             if self.config.max_steps and step >= self.config.max_steps:
@@ -451,6 +456,38 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             )
         return model_response, trajectory, model_server_cookies, resources_server_cookies
 
+    async def _record_outputs(
+        self,
+        record_outputs_path: str,
+        model_response: NeMoGymResponse,
+        resources_server_cookies: Any,
+    ) -> tuple[dict[str, Any], Any]:
+        """Record one model response with Resources and read what to do next.
+
+        Recorded before this response's tool calls are issued, so a caller
+        whose own loop owns the conversation executes them itself and this
+        Agent follows the reply rather than guessing the loop's shape.
+        """
+        record_response = await self.server_client.post(
+            server_name=self.config.resources_server.name,
+            url_path=record_outputs_path,
+            json={
+                "response": _chat_message_from_response(model_response),
+                "usage": (
+                    {
+                        "input_tokens": model_response.usage.input_tokens or 0,
+                        "output_tokens": model_response.usage.output_tokens or 0,
+                    }
+                    if model_response.usage is not None
+                    else None
+                ),
+            },
+            cookies=resources_server_cookies,
+        )
+        await raise_for_status(record_response)
+        payload = await get_response_json(record_response)
+        return payload, _merge_cookie_values(resources_server_cookies, record_response.cookies)
+
     async def responses(
         self,
         request: Request,
@@ -472,8 +509,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             rollout_id=rollout_id or "unscoped",
             collect_trajectory=collect_trajectory,
             invocation_id=f"activation-{len(session.trajectories)}" if session is not None else "root",
-            tool_loop_policy=session.tool_loop_policy if session is not None else None,
-            tool_batch_path=session.tool_batch_path if session is not None else None,
+            record_outputs_path=session.record_outputs_path if session is not None else None,
         )
         if session is not None:
             session.resources_cookies = dict(resources_server_cookies)

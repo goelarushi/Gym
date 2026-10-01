@@ -18,7 +18,7 @@ def test_compute_task_metrics_reports_usersim_input_contract() -> None:
                 "probe_type": "general_open_ended",
                 "theme": {"type": "local food", "description": "Find dinner."},
                 "trajectory_id": "native-trajectory",
-                "usersim_provenance": {"code_sha": "4fd4c800bbef8883329543df632f328860fc6429"},
+                "usersim_provenance": {"code_sha": "a4665b3ce1a030e83871232e2fb69e5b39480818"},
                 "usersim_config": {"random_seed": 1042},
             },
             "responses_create_params": {

@@ -41,7 +41,7 @@ architecture section later on explains it for readers who want to customize mode
 
 <Info>
 The UserSim integration is under active development. It currently installs UserSim revision
-`4fd4c800bbef8883329543df632f328860fc6429` from GitHub over SSH. The installation host needs access to
+`a4665b3ce1a030e83871232e2fb69e5b39480818` from GitHub over SSH. The installation host needs access to
 [NVIDIA-NeMo/UserSim](https://github.com/NVIDIA-NeMo/UserSim).
 </Info>
 
@@ -159,11 +159,13 @@ or support activation. The Environment Server routes participant activations as 
 the matching Agent Server and support activations directly to the support Model Server. For every probe, the
 Resources Server creates exactly one episode-scoped UserSim runtime with
 `ProbeEpisodeRuntime.from_resolved_row`. For `tool_calling`, `safety_agentic`, and `financial_services`, that
-runtime also publishes simulated tools and a tool-loop policy. The Assistant Agent mechanically executes
-model-to-tool-to-model iteration under that policy against standard Resources endpoints. The Environment Server
-never constructs a second copy of the probe or owns the tool loop. UserSim assigns semantic tool turn/call
-indices, including ordered parallel batches. Resources returns each single simulated payload as opaque text, so
-plain-text mocks are not JSON-wrapped or retried.
+runtime also publishes the probe's simulated tools. The Assistant Agent owns model-to-tool-to-model iteration:
+it records each model response with Resources before issuing that response's tool calls, then follows the reply
+— continue or stop, tools on or off, and the input UserSim would send next. Recording is what makes UserSim
+execute the calls inside its own conversation loop, so the turn and call indices and the tool simulator's
+context are UserSim's, and the Agent never has to model the loop. The Environment Server coordinates and never
+constructs a second copy of the probe. Resources returns each simulated payload as opaque text, so plain-text
+mocks are not JSON-wrapped or retried.
 
 The **Judge** and **Summary** support aliases are model calls rather than Agents. Native non-tool conversations
 can invoke them for semantic checks and optional context processing; Resources-owned verification, probe

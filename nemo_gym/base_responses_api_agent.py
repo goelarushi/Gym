@@ -15,7 +15,7 @@
 from abc import abstractmethod
 from collections.abc import Mapping
 from functools import wraps
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 from warnings import warn
 
 from fastapi import Body, FastAPI, Request
@@ -54,22 +54,6 @@ from nemo_gym.telemetry.span_groups import GymSpanGroup
 from nemo_gym.tool_access import ToolAccess
 
 
-class AgentToolLoopPolicy(BaseModel):
-    """Optional episode-scoped policy for an Agent-owned model/tool loop."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    tool_round_mode: Literal["single", "multi"]
-    max_assistant_activations: int = Field(ge=1)
-    final_synthesis_without_tools: bool
-    single_user_turn: bool
-    assistant_error_behavior: Literal["fail_episode"]
-    tool_error_behavior: Literal["return_error_payload"]
-    max_tool_calls_per_turn: int | None = Field(default=None, ge=1)
-    max_tool_response_attempts: int = Field(ge=1)
-    assistant_resampling: bool
-
-
 class AgentSeedSessionRequest(BaseModel):
     """Idempotently initialize agent-server state under a caller-assigned identifier."""
 
@@ -80,7 +64,12 @@ class AgentSeedSessionRequest(BaseModel):
     task_id: TaskId
     tool_accesses: list[ToolAccess] = Field(default_factory=list)
     sandbox_access: SandboxAccess | None = None
-    tool_loop_policy: AgentToolLoopPolicy | None = None
+    #: Resources path the Agent records each model response to before issuing
+    #: that response's tool calls. The reply tells the Agent whether its turn
+    #: continues, which tools are offered next, and the input to send -- so an
+    #: environment whose own loop owns the conversation can keep that loop
+    #: without the Agent having to model it. Unset means no recording.
+    record_outputs_path: str | None = Field(default=None, pattern=r"^/")
 
     @field_validator("tool_accesses")
     @classmethod

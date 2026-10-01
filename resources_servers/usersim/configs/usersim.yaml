@@ -34,7 +34,7 @@ usersim_resources:
       domain: agent
       verified: false
       description: Canonical NeMo UserSim probe runtime and verification.
-      usersim_revision: 4fd4c800bbef8883329543df632f328860fc6429  # pragma: allowlist secret
+      usersim_revision: a4665b3ce1a030e83871232e2fb69e5b39480818  # pragma: allowlist secret
       tool_simulation_model:
         type: responses_api_models
         name: support_model
@@ -53,7 +53,7 @@ usersim_user:
       entrypoint: app.py
       model_server:
         type: responses_api_models
-        name: policy_model
+        name: support_model
       resources_server:
         type: resources_servers
         name: usersim_resources

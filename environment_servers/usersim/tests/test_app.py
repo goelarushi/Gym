@@ -14,7 +14,7 @@ from environment_servers.usersim.app import (
     _apply_activation_parameters,
     _ConversationBridge,
     _is_retryable_dependency_error,
-    _response_output_messages,
+    _response_chat_message,
     _to_responses_input_items,
 )
 from nemo_gym.base_environment_server import BaseEnvironmentServer
@@ -143,31 +143,6 @@ def _runtime_descriptor() -> ProbeRuntimeDescriptor:
                     },
                 }
             ],
-            "allowed_tool_names": ["safe_action"],
-            "initial_user_message": "Perform the action.",
-            "loop_policy": {
-                "tool_round_mode": "multi",
-                "max_assistant_activations": 3,
-                "final_synthesis_without_tools": False,
-                "single_user_turn": True,
-                "assistant_error_behavior": "fail_episode",
-                "tool_error_behavior": "return_error_payload",
-                "max_tool_response_attempts": 1,
-                "assistant_resampling": False,
-            },
-            "user_system_prompt": "",
-            "assistant_system_prompt": "",
-            "turn0_user_query_instruction": None,
-            "user_interaction_style": "direct",
-            "patience": 0.5,
-            "user_turn_policy": {
-                "context_compression": True,
-                "wrap_up": True,
-                "followup_anchor": None,
-                "allowed_phrases": [],
-                "script_check_ignores": [],
-                "check_opening": "none",
-            },
         }
     )
 
@@ -294,7 +269,7 @@ def _request() -> UserSimEpisodeRequest:
                     "locale": "en_US",
                     "trajectory_id": "native-trajectory",
                     "usersim_provenance": {
-                        "code_sha": "4fd4c800bbef8883329543df632f328860fc6429",
+                        "code_sha": "a4665b3ce1a030e83871232e2fb69e5b39480818",
                     },
                     "usersim_config": {"random_seed": 42},
                 },
@@ -324,7 +299,7 @@ def _queue_success_responses(client: _Client) -> None:
                         "locale": "en_US",
                         "trajectory_id": "native-trajectory",
                         "usersim_provenance": {
-                            "code_sha": "4fd4c800bbef8883329543df632f328860fc6429",
+                            "code_sha": "a4665b3ce1a030e83871232e2fb69e5b39480818",
                         },
                         "usersim_config": {"random_seed": 42},
                     },
@@ -352,7 +327,9 @@ def _queue_success_responses(client: _Client) -> None:
                     "model_alias": "assistant_model",
                     "messages": [{"role": "user", "content": "I need dinner advice."}],
                     "parameters": {"max_tokens": 128, "temperature": 0.3, "top_p": 0.9},
-                    "assistant_tool_loop_policy": _runtime_descriptor().loop_policy.model_dump(mode="json"),
+                    "tools": _runtime_descriptor().assistant_tools,
+                    "tools_enabled": True,
+                    "continues_turn": False,
                 }
             ),
             _Response(_model_response("assistant-response", "Try a lentil curry.")),
@@ -419,14 +396,13 @@ def _queue_success_responses(client: _Client) -> None:
     )
 
 
-def test_assistant_activation_preserves_complete_tool_transcript() -> None:
-    response = NeMoGymResponse.model_validate(_tool_model_response())
-    transcript = _response_output_messages(response)
+def test_assistant_response_keeps_tool_calls_and_reasoning() -> None:
+    """UserSim stores reasoning by default; dropping it here would lose it."""
+    message = _response_chat_message(NeMoGymResponse.model_validate(_tool_model_response()))
 
-    assert [message["role"] for message in transcript] == ["assistant", "tool", "assistant"]
-    assert transcript[0]["tool_calls"][0]["id"] == "call-1"
-    assert transcript[0]["reasoning_content"] == "Inspect the tool result."
-    assert transcript[1]["tool_call_id"] == "call-1"
+    assert message["role"] == "assistant"
+    assert message["tool_calls"][0]["id"] == "call-1"
+    assert message["reasoning_content"] == "Inspect the tool result."
 
 
 def test_strict_response_format_requires_all_nullable_fields_and_forbids_extras() -> None:
@@ -451,7 +427,7 @@ def test_strict_response_format_requires_all_nullable_fields_and_forbids_extras(
                 },
             }
         },
-        assistant_tools=None,
+        tools=[],
     )
 
     schema = values["text"]["format"]["schema"]
@@ -510,8 +486,10 @@ async def test_usersim_environment_server_runs_native_episode() -> None:
         "/runtime/start",
         "/ng-rollout/rollout-a2/v1/responses",
         "/runtime/advance",
+        # The Assistant Agent recorded its own turn, so this server re-reads
+        # where the episode got to instead of submitting a result.
         "/ng-rollout/rollout-a2/v1/responses",
-        "/runtime/advance",
+        "/runtime/pending",
         "/v1/responses",
         "/runtime/advance",
         "/v1/responses",
@@ -522,10 +500,13 @@ async def test_usersim_environment_server_runs_native_episode() -> None:
         "/close_session",
     ]
     assert client.calls[1][2]["json"]["tool_accesses"] == []
+    # The Assistant Agent keeps Resources access: it records each response and
+    # collects UserSim's tool payloads itself.
     [tool_access] = client.calls[2][2]["json"]["tool_accesses"]
     assert tool_access["name"] == "resources.direct_http"
     assert tool_access["cookies"] == {"session": "resources-cookie"}
-    assert tool_access["batch_path"] == "/runtime/tool_calls"
+    assert client.calls[2][2]["json"]["record_outputs_path"] == "/runtime/record"
+    assert client.calls[1][2]["json"]["record_outputs_path"] is None
     assert client.calls[4][2]["cookies"] == {"session": "user-cookie"}
     assert client.calls[6][2]["cookies"] == {"session": "assistant-cookie"}
     assert client.calls[8][0] == "support"

@@ -21,7 +21,6 @@ from fastapi import Response
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
-from nemo_gym.base_responses_api_agent import AgentToolLoopPolicy
 from nemo_gym.global_config import (
     AGENT_REF_KEY_NAME,
     ATTEMPT_INDEX_KEY_NAME,
@@ -451,68 +450,78 @@ class TestApp:
         assert (tool.output, tool.status, tool.error_type) == ("bad input", "failed", "http_422")
         assert tool.started_at is not None and tool.completed_at is not None and tool.duration_ms is not None
 
-    async def test_session_policy_enforces_final_synthesis_and_tool_identity(self) -> None:
-        server, server_client = _make_agent(True)
-        response_base = {
-            "created_at": 1.0,
-            "model": "model",
-            "object": "response",
-            "parallel_tool_calls": True,
-            "tool_choice": "auto",
-            "tools": [],
-        }
+    async def test_recording_follows_the_callers_reply_instead_of_its_own_transcript(self) -> None:
+        """The Agent owns the loop; the caller's reply decides its shape.
+
+        The caller supplies the next input, which replaces the Agent's own
+        accumulated transcript: the two diverge for callers that trim context,
+        and the caller's is the one its loop will score.
+        """
+        server, server_client = _make_agent(observability_enabled=True)
+
+        def model_payload(response_id: str, *, call_id: str | None) -> dict:
+            output = (
+                [
+                    {
+                        "id": call_id,
+                        "call_id": call_id,
+                        "name": "lookup",
+                        "arguments": '{"query": "x"}',
+                        "type": "function_call",
+                        "status": "completed",
+                    }
+                ]
+                if call_id
+                else [
+                    {
+                        "id": f"{response_id}-message",
+                        "content": [{"annotations": [], "text": "done", "type": "output_text"}],
+                        "role": "assistant",
+                        "status": "completed",
+                        "type": "message",
+                    }
+                ]
+            )
+            return {
+                "id": response_id,
+                "created_at": 1,
+                "model": "model",
+                "object": "response",
+                "output": output,
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            }
+
         model_payloads = iter(
-            [
-                response_base
-                | {
-                    "id": "tool-response",
-                    "output": [
-                        {
-                            "id": "fc-1",
-                            "call_id": "call-7",
-                            "name": "lookup",
-                            "arguments": '{"query":"x"}',
-                            "type": "function_call",
-                            "status": "completed",
-                        },
-                        {
-                            "id": "fc-2",
-                            "call_id": "call-8",
-                            "name": "lookup",
-                            "arguments": '{"query":"ignored"}',
-                            "type": "function_call",
-                            "status": "completed",
-                        },
-                    ],
-                },
-                response_base
-                | {
-                    "id": "final-response",
-                    "output": [
-                        {
-                            "id": "message-1",
-                            "content": [{"annotations": [], "text": "final", "type": "output_text"}],
-                            "role": "assistant",
-                            "status": "completed",
-                            "type": "message",
-                        }
-                    ],
-                },
-            ]
+            [model_payload("response-1", call_id="call-7"), model_payload("response-2", call_id=None)]
         )
+        records = [
+            {
+                "should_continue": True,
+                "input": [{"type": "message", "role": "user", "content": "caller trimmed context"}],
+                "tools": [],
+                "executed_tool_call_ids": ["call-7"],
+                "complete": False,
+            },
+            {"should_continue": False, "input": [], "tools": [], "executed_tool_call_ids": [], "complete": True},
+        ]
+        record_bodies: list[dict] = []
+        second_request: dict = {}
 
         async def post(*, server_name, url_path, **kwargs):
             if server_name == "model":
+                if record_bodies:
+                    second_request.update({"input": kwargs["json"].input, "tools": kwargs["json"].tools})
                 return _mock_response(next(model_payloads))
-            assert (server_name, url_path) == ("resources", "/runtime/tool_calls")
-            resource_response = _mock_response(payload=["first opaque payload", "second opaque payload"])
-            cookie = MagicMock()
-            cookie.value = "updated-cookie"
-            resource_response.cookies = {"resources-session": cookie}
-            return resource_response
+            if url_path == "/runtime/record":
+                record_bodies.append(kwargs["json"])
+                return _mock_response(records[len(record_bodies) - 1])
+            assert url_path == "/lookup", url_path
+            return _mock_response(content="opaque payload")
 
         server_client.post = AsyncMock(side_effect=post)
-        response, _, _, resource_cookies = await server._create_episode(
+        response, _, _, _ = await server._create_episode(
             NeMoGymResponseCreateParamsNonStreaming(
                 input="question",
                 tools=[
@@ -529,40 +538,22 @@ class TestApp:
             resources_server_cookies={},
             collect_trajectory=True,
             invocation_id="activation-4",
-            tool_batch_path="/runtime/tool_calls",
-            tool_loop_policy=AgentToolLoopPolicy(
-                tool_round_mode="single",
-                max_assistant_activations=2,
-                final_synthesis_without_tools=True,
-                single_user_turn=False,
-                assistant_error_behavior="fail_episode",
-                tool_error_behavior="return_error_payload",
-                max_tool_calls_per_turn=None,
-                max_tool_response_attempts=1,
-                assistant_resampling=False,
-            ),
+            record_outputs_path="/runtime/record",
         )
 
+        # Recorded before the tool call was issued, and with reasoning intact.
+        assert record_bodies[0]["response"]["tool_calls"][0]["id"] == "call-7"
         assert [item.type for item in response.output] == [
             "function_call",
-            "function_call",
-            "function_call_output",
             "function_call_output",
             "message",
         ]
-        batch_call = server_client.post.await_args_list[1]
-        assert batch_call.kwargs["json"] == [
-            {"tool_call_id": "call-7", "tool_name": "lookup", "arguments": {"query": "x"}},
-            {"tool_call_id": "call-8", "tool_name": "lookup", "arguments": {"query": "ignored"}},
-        ]
-        assert "headers" not in batch_call.kwargs
-        assert [item.output for item in response.output if item.type == "function_call_output"] == [
-            "first opaque payload",
-            "second opaque payload",
-        ]
-        final_request = server_client.post.await_args_list[2].kwargs["json"]
-        assert final_request.tools == []
-        assert resource_cookies == {"resources-session": "updated-cookie"}
+        assert [item.output for item in response.output if item.type == "function_call_output"] == ["opaque payload"]
+        # Second model call used the caller's input and its tools-off decision.
+        # The items are validated, not passed through raw: a model server
+        # cannot consume the plain JSON the caller sent.
+        assert [(item.role, item.content) for item in second_request["input"]] == [("user", "caller trimmed context")]
+        assert second_request["tools"] == []
 
     @pytest.mark.parametrize(("capture_enabled", "override_responses"), ((False, False), (True, False), (True, True)))
     async def test_run_preserves_self_dispatch(self, capture_enabled: bool, override_responses: bool) -> None:

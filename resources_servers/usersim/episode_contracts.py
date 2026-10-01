@@ -6,9 +6,10 @@
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from nemo_gym.base_resources_server import (
+    ResourcesSeedSessionRequest,
     ResourcesSeedSessionResponse,
     ResourcesVerifyRequest,
 )
@@ -32,51 +33,39 @@ class UserSimTaskInput(BaseModel):
     )
 
 
-class AssistantToolLoopPolicy(BaseModel):
-    """Serializable assistant/tool-loop policy supplied by UserSim."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    tool_round_mode: Literal["single", "multi"]
-    max_assistant_activations: int = Field(ge=1)
-    final_synthesis_without_tools: bool
-    single_user_turn: bool
-    assistant_error_behavior: Literal["fail_episode"]
-    tool_error_behavior: Literal["return_error_payload"]
-    max_tool_calls_per_turn: int | None = Field(default=None, ge=1)
-    max_tool_response_attempts: int = Field(ge=1)
-    assistant_resampling: bool
-
-
-class UserTurnPolicySnapshot(BaseModel):
-    """JSON-safe subset of UserSim's outer user-turn policy."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    context_compression: bool
-    wrap_up: bool
-    followup_anchor: str | None
-    allowed_phrases: list[str]
-    script_check_ignores: list[str]
-    check_opening: Literal["none", "native"]
-
-
 class ProbeRuntimeDescriptor(BaseModel):
-    """Strict mirror of UserSim's externally hosted runtime descriptor."""
+    """Strict mirror of UserSim's externally hosted runtime descriptor.
+
+    Deliberately small. Every per-call decision -- whether tools are offered,
+    whether the turn continues, what to send next -- rides on the activation
+    reply, so neither this environment nor the Agent models UserSim's loop.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     probe_type: str
-    assistant_tools: list[dict[str, Any]]
-    allowed_tool_names: list[str]
-    initial_user_message: str | None
-    loop_policy: AssistantToolLoopPolicy
-    user_system_prompt: str
-    assistant_system_prompt: str
-    turn0_user_query_instruction: str | None
-    user_interaction_style: str
-    patience: float
-    user_turn_policy: UserTurnPolicySnapshot
+    assistant_tools: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class UserSimRoleModel(BaseModel):
+    """The model identity and token budget this environment runs for one role.
+
+    UserSim keys trajectory identity on the resolved model id, and
+    ``identity_disclosure`` cannot grade an assistant it cannot name, so the
+    host declares what is behind each role rather than letting UserSim fall
+    back to the models preparation happened to be configured with.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str = Field(min_length=1)
+    max_tokens: int | None = Field(default=None, gt=0)
+
+
+class UserSimSeedSessionRequest(ResourcesSeedSessionRequest):
+    """Seed one episode, declaring the models this environment will run."""
+
+    role_models: dict[str, UserSimRoleModel] = Field(default_factory=dict)
 
 
 class UserSimSeedResponse(ResourcesSeedSessionResponse):
@@ -97,23 +86,36 @@ class UserSimActivationRequest(BaseModel):
     model_alias: str = Field(min_length=1)
     messages: list[dict[str, Any]]
     parameters: dict[str, Any]
-    assistant_tool_loop_policy: AssistantToolLoopPolicy | None = None
+    #: Tools UserSim offers for this call. Empty means tools are off, which is
+    #: how a probe asks the assistant for its final answer.
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    tools_enabled: bool = False
+    #: True when this activation continues the turn already in progress. The
+    #: Assistant Agent keeps its loop running while this stays true.
+    continues_turn: bool = False
+
+
+class UserSimActivationUsage(BaseModel):
+    """Token usage observed for one activation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
 
 
 class UserSimActivationResult(BaseModel):
-    """One externally executed result submitted to the native lifecycle."""
+    """One model response recorded against the native lifecycle.
+
+    The response is recorded, tool calls included, before those calls are
+    issued; UserSim's own loop executes them as part of recording.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     activation_id: str = Field(min_length=1)
-    response: dict[str, Any] | None = None
-    transcript_delta: list[dict[str, Any]] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def require_exactly_one_payload(self) -> "UserSimActivationResult":
-        if (self.response is None) == (not self.transcript_delta):
-            raise ValueError("exactly one of response or transcript_delta is required")
-        return self
+    response: dict[str, Any]
+    usage: UserSimActivationUsage | None = None
 
 
 class UserSimSimulationResult(BaseModel):
@@ -149,6 +151,49 @@ class UserSimEpisodeLifecycleComplete(BaseModel):
 
 
 UserSimLifecycleEvent = UserSimActivationRequest | UserSimEpisodeLifecycleComplete
+
+
+class UserSimAgentRecordRequest(BaseModel):
+    """One Assistant-Agent model response recorded against the live episode.
+
+    No activation id: the session knows which activation it is waiting on, so
+    the Agent records a model response and nothing else.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    response: dict[str, Any]
+    usage: UserSimActivationUsage | None = None
+
+
+class UserSimAgentRecordResponse(BaseModel):
+    """What UserSim tells the Assistant Agent to do next.
+
+    The Agent owns its model/tool loop, but it does not decide the loop's
+    shape: it records each response, then follows this reply. ``input`` is the
+    exact input UserSim would send next, which is why the Agent replaces its
+    own accumulated transcript with it -- the two diverge for probes that trim
+    their context.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: True while the next activation continues this assistant turn.
+    should_continue: bool
+    #: The next activation's identity, when the turn continues.
+    activation_id: str | None = None
+    #: The input UserSim would send next, already as Responses input items so
+    #: a general-purpose Agent never has to know UserSim's message shape.
+    input: list[dict[str, Any]] = Field(default_factory=list)
+    #: Tools offered for the next call, as Responses function tools. Empty
+    #: means the probe turned them off for that call.
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    #: Tool payloads UserSim's loop produced for the recorded call ids, in
+    #: execution order. A probe may cap how many calls it runs per turn, so a
+    #: recorded call can be absent.
+    executed_tool_call_ids: list[str] = Field(default_factory=list)
+    #: True once the episode has finished; the Agent stops either way.
+    complete: bool = False
 
 
 class UserSimInvocation(BaseModel):

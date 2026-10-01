@@ -6,8 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import uuid4
@@ -26,14 +25,12 @@ from nemo_gym.base_environment_server import (
 from nemo_gym.base_resources_server import (
     ResourcesCloseSessionRequest,
     ResourcesCloseSessionResponse,
-    ResourcesSeedSessionRequest,
 )
 from nemo_gym.base_responses_api_agent import (
     AgentCloseSessionRequest,
     AgentCloseSessionResponse,
     AgentSeedSessionRequest,
     AgentSeedSessionResponse,
-    AgentToolLoopPolicy,
 )
 from nemo_gym.config_types import (
     TOKEN_CAPTURE_PATH_SEGMENT,
@@ -45,7 +42,6 @@ from nemo_gym.config_types import (
 )
 from nemo_gym.global_config import TOKEN_ID_CAPTURE_BLOCK, get_first_server_config_dict
 from nemo_gym.openai_utils import (
-    NeMoGymFunctionCallOutput,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
     NeMoGymResponseFunctionToolCall,
@@ -63,13 +59,16 @@ from nemo_gym.tool_access import (
 from resources_servers.usersim.episode_contracts import (
     UserSimActivationRequest,
     UserSimActivationResult,
+    UserSimActivationUsage,
     UserSimEpisodeFailure,
     UserSimEpisodeLifecycleComplete,
     UserSimEpisodeRequest,
     UserSimEpisodeResponse,
     UserSimEpisodeResult,
     UserSimInvocation,
+    UserSimRoleModel,
     UserSimSeedResponse,
+    UserSimSeedSessionRequest,
     UserSimSimulationResult,
     UserSimTaskInput,
     UserSimVerification,
@@ -154,11 +153,7 @@ class _ConversationBridge:
             base_params = NeMoGymResponseCreateParamsNonStreaming(input=[])
         values = base_params.model_dump(mode="json", exclude_none=True)
         values["input"] = [item for message in activation.messages for item in _to_responses_input_items(message)]
-        _apply_activation_parameters(
-            values,
-            activation.parameters,
-            assistant_tools=self.assistant_tools if alias == "assistant_model" else None,
-        )
+        _apply_activation_parameters(values, activation.parameters, tools=activation.tools)
         request_params = NeMoGymResponseCreateParamsNonStreaming.model_validate(values)
 
         target = self.environment_server.config.target_for_alias(alias)
@@ -202,15 +197,15 @@ class _ConversationBridge:
                 ),
             )
         )
-        if role == "assistant":
-            return UserSimActivationResult(
-                activation_id=activation.activation_id,
-                transcript_delta=_response_output_messages(gym_response),
-            )
         return UserSimActivationResult(
             activation_id=activation.activation_id,
             response=_response_chat_message(gym_response),
+            usage=_response_usage(gym_response),
         )
+
+    async def invoke_assistant(self, activation: UserSimActivationRequest) -> None:
+        """Hand one assistant turn to the Agent, which records it itself."""
+        await self.invoke(activation)
 
 
 class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, UserSimEpisodeResponse]):
@@ -230,6 +225,26 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
         await raise_for_status(response)
         return AggregateMetrics.model_validate(await get_response_json(response))
 
+    def _role_models(self, task: UserSimTaskInput) -> dict[str, UserSimRoleModel]:
+        """Declare the model and token budget this environment runs per role.
+
+        UserSim keys trajectory identity on the resolved model id, and
+        ``identity_disclosure`` cannot grade an assistant it cannot name. Left
+        unset, UserSim falls back to the models preparation was configured
+        with, which are not the models this environment runs.
+        """
+        role_models: dict[str, UserSimRoleModel] = {}
+        for alias, role in _INVOCATION_ROLE_BY_ALIAS.items():
+            params = task.responses_create_params.get(role)
+            model_name = getattr(params, "model", None) if params is not None else None
+            if not model_name:
+                model_name = self.config.target_for_alias(alias).name
+            role_models[alias] = UserSimRoleModel(
+                model_name=str(model_name),
+                max_tokens=getattr(params, "max_output_tokens", None) if params is not None else None,
+            )
+        return role_models
+
     async def run(
         self,
         request: UserSimEpisodeRequest,
@@ -242,11 +257,12 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
             seed_http_response = await self.server_client.post(
                 server_name=self.config.resources_server.name,
                 url_path="/seed_session",
-                json=ResourcesSeedSessionRequest(
+                json=UserSimSeedSessionRequest(
                     resources_session_id=resources_session_id,
                     episode_id=request.episode_id,
                     task_id=request.task.task_id,
                     task_data=task.model_dump(mode="json"),
+                    role_models=self._role_models(task),
                 ),
             )
             await raise_for_status(seed_http_response)
@@ -289,11 +305,10 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
                     task_id=request.task.task_id,
                     tool_accesses=tool_accesses if alias == "assistant_model" else [],
                     sandbox_access=seed.sandbox_access if alias in {"user_model", "assistant_model"} else None,
-                    tool_loop_policy=(
-                        AgentToolLoopPolicy.model_validate(seed.runtime_descriptor.loop_policy.model_dump(mode="json"))
-                        if alias == "assistant_model" and seed.runtime_descriptor is not None
-                        else None
-                    ),
+                    # The Assistant Agent owns its model/tool loop and follows
+                    # UserSim's reply at each step. The User Agent is offered no
+                    # tools, so it answers one activation and returns.
+                    record_outputs_path="/runtime/record" if alias == "assistant_model" else None,
                 )
                 session_http_response = await self.server_client.post(
                     server_name=target.name,
@@ -413,11 +428,20 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
         await raise_for_status(response)
         event = _parse_lifecycle_event(await get_response_json(response))
         while isinstance(event, UserSimActivationRequest):
-            result = await bridge.invoke(event)
+            if event.role == "assistant":
+                # The Assistant Agent owns its model/tool loop: it records each
+                # response with Resources itself, which is what advances the
+                # episode, so this server re-reads where the episode got to
+                # rather than submitting anything of its own.
+                await bridge.invoke_assistant(event)
+                url_path, payload = "/runtime/pending", {}
+            else:
+                result = await bridge.invoke(event)
+                url_path, payload = "/runtime/advance", result.model_dump(mode="json", exclude_none=True)
             response = await self.server_client.post(
                 server_name=self.config.resources_server.name,
-                url_path="/runtime/advance",
-                json=result.model_dump(mode="json"),
+                url_path=url_path,
+                json=payload,
                 cookies=bridge.resources_cookies,
             )
             await raise_for_status(response)
@@ -447,7 +471,6 @@ class UserSimEnvironmentServer(BaseEnvironmentServer[UserSimEpisodeRequest, User
                     required=True,
                     base_url=resources_base_url,
                     cookies=resources_cookies,
-                    batch_path="/runtime/tool_calls",
                 )
             )
         if "mcp" in self.config.resources_tool_transports:
@@ -563,12 +586,17 @@ def _apply_activation_parameters(
     values: dict[str, Any],
     parameters: Mapping[str, Any],
     *,
-    assistant_tools: list[dict[str, Any]] | None,
+    tools: Sequence[Mapping[str, Any]],
 ) -> None:
+    """Translate one activation into Responses API call parameters.
+
+    ``tools`` comes from the activation, not from this server: a probe turns
+    tools off for the step where it asks the assistant for its final answer,
+    and the empty list is how it says so.
+    """
     translated = {
         "max_tokens",
         "max_completion_tokens",
-        "tools",
         "tool_choice",
         "reasoning_effort",
         "response_format",
@@ -596,10 +624,10 @@ def _apply_activation_parameters(
     max_tokens = parameters.get("max_tokens") or parameters.get("max_completion_tokens")
     if max_tokens is not None:
         values["max_output_tokens"] = max_tokens
-    tools = parameters.get("tools")
     if tools:
-        selected_tools = assistant_tools if assistant_tools is not None else list(tools)
-        values["tools"] = [_to_responses_tool(tool) for tool in selected_tools]
+        values["tools"] = [_to_responses_tool(tool) for tool in tools]
+    else:
+        values.pop("tools", None)
     if parameters.get("tool_choice") is not None:
         values["tool_choice"] = parameters["tool_choice"]
     if parameters.get("reasoning_effort") is not None:
@@ -640,6 +668,17 @@ def _response_text(response: NeMoGymResponse) -> str:
     return "\n".join(chunks)
 
 
+def _response_usage(response: NeMoGymResponse) -> UserSimActivationUsage | None:
+    """Carry the provider's token counts into UserSim's per-model accounting."""
+    usage = response.usage
+    if usage is None:
+        return None
+    return UserSimActivationUsage(
+        input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+        output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+    )
+
+
 def _response_chat_message(response: NeMoGymResponse) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": _response_text(response)}
     reasoning = _response_reasoning(response)
@@ -669,62 +708,6 @@ def _response_reasoning(response: NeMoGymResponse) -> str:
             if text:
                 chunks.append(text)
     return "\n".join(chunks)
-
-
-def _response_output_messages(response: NeMoGymResponse) -> list[dict[str, Any]]:
-    """Convert one complete Agent activation to canonical chat messages."""
-    messages: list[dict[str, Any]] = []
-    pending_calls: list[dict[str, Any]] = []
-    pending_reasoning: list[str] = []
-
-    def flush_calls() -> None:
-        if pending_calls:
-            message: dict[str, Any] = {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": list(pending_calls),
-            }
-            if pending_reasoning:
-                message["reasoning_content"] = "\n".join(pending_reasoning)
-            messages.append(message)
-            pending_calls.clear()
-            pending_reasoning.clear()
-
-    for item in response.output:
-        if isinstance(item, NeMoGymResponseReasoningItem):
-            for part in [*item.summary, *(item.content or [])]:
-                text = getattr(part, "text", None)
-                if text:
-                    pending_reasoning.append(text)
-            continue
-        if isinstance(item, NeMoGymResponseFunctionToolCall):
-            pending_calls.append(
-                {
-                    "id": item.call_id,
-                    "type": "function",
-                    "function": {"name": item.name, "arguments": item.arguments},
-                }
-            )
-            continue
-        flush_calls()
-        if isinstance(item, NeMoGymFunctionCallOutput):
-            messages.append(
-                {
-                    "role": "tool",
-                    "content": item.output if isinstance(item.output, str) else json.dumps(item.output),
-                    "tool_call_id": item.call_id,
-                }
-            )
-        elif isinstance(item, NeMoGymResponseOutputMessage):
-            message = {"role": "assistant", "content": _response_message_text(item)}
-            if pending_reasoning:
-                message["reasoning_content"] = "\n".join(pending_reasoning)
-                pending_reasoning.clear()
-            messages.append(message)
-    flush_calls()
-    if pending_reasoning:
-        messages.append({"role": "assistant", "content": "", "reasoning_content": "\n".join(pending_reasoning)})
-    return messages
 
 
 def _response_message_text(message: NeMoGymResponseOutputMessage) -> str:

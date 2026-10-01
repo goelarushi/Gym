@@ -2,7 +2,7 @@
 
 The Resources Server hosts one canonical UserSim runtime per Gym episode. The
 prepared task contains an unchanged `resolved_row` produced by UserSim at
-revision `4fd4c800bbef8883329543df632f328860fc6429`.
+revision `a4665b3ce1a030e83871232e2fb69e5b39480818`.
 
 At `/seed_session`, Resources validates the row's UserSim revision and
 trajectory identity, then constructs the episode only through:
@@ -18,21 +18,35 @@ descriptor and Assistant tool schemas.
 
 ## Tool execution
 
-The Assistant Agent retains the mechanical model → tool → model loop.
-Resources exposes:
+The Assistant Agent retains the mechanical model → tool → model loop, but it
+does not decide the loop's shape. Per step it:
 
-- `POST /{tool_name}` for one call, identified only by
-  `X-NeMo-Gym-Tool-Call-Id`.
-- `POST /runtime/tool_calls` for an ordered parallel batch.
+1. calls its model;
+2. records that response with `POST /runtime/record`, **before** issuing the
+   response's tool calls;
+3. reads the reply — whether the turn continues, which tools are offered next,
+   and the exact input UserSim would send;
+4. collects each executed call's payload from `POST /{tool_name}`, identified
+   only by `X-NeMo-Gym-Tool-Call-Id`.
 
-UserSim assigns semantic turn and call indices. Gym does not send host turn or
-call index headers. Single-call responses return UserSim's payload as opaque
-plain text without JSON parsing or a wrapper. Batch responses preserve each
-payload string in request order.
+Recording is what makes UserSim execute the calls, inside its own conversation
+loop and with its own turn and call indices. Gym sends no turn or call index
+headers, and there is no batch route: parallel calls arrive together in one
+recorded response.
 
-The shared Resources session cookie selects the episode allowlist, state, and
-evidence. Identical UserSim call-ID retries are idempotent; conflicting reuse
-is rejected by UserSim.
+The reply's input replaces the Agent's own accumulated transcript. The two
+diverge for probes that trim their context, and UserSim's is the one the
+episode is scored on.
+
+Payloads are returned as opaque plain text, without JSON parsing or a wrapper;
+several probes' simulated responses are not JSON. A probe caps how many calls
+it runs per turn, so `executed_tool_call_ids` on the reply is the authoritative
+list of which recorded calls actually ran.
+
+A recorded response that breaks the probe's loop rules — tool calls when the
+activation offers none, an unoffered tool name, a missing or repeated call id —
+returns HTTP 422. These are host bugs, so they never consume a model retry and
+are never attributed to the model under test.
 
 ## Lifecycle and verification
 

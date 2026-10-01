@@ -11,9 +11,11 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from omegaconf import OmegaConf
 from pydantic import ConfigDict
-from usersim.engine.core.episode_runtime import ProbeEpisodeRuntime
+from usersim.engine.core.episode_runtime import HostRoleModel, ProbeEpisodeRuntime
+from usersim.engine.core.probes import known_probes
 from usersim.engine.external import materialize_episode_inputs
 from usersim.engine.generator import ConversationSimulatorGenerator
 
@@ -21,21 +23,24 @@ from environment_servers.usersim.app import (
     UserSimEnvironmentServer,
     UserSimEnvironmentServerConfig,
     _apply_activation_parameters,
-    _response_output_messages,
     _to_responses_input_items,
 )
-from nemo_gym.base_resources_server import ResourcesSeedSessionRequest
-from nemo_gym.base_responses_api_agent import AgentToolLoopPolicy
 from nemo_gym.config_types import AgentServerRef, ModelServerRef, ResourcesServerRef
 from nemo_gym.episode_types import EpisodeId, TaskId
-from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.server_utils import SESSION_ID_KEY, BaseServerConfig, ServerClient
 from resources_servers.usersim.app import UserSimResourcesServer, UserSimResourcesServerConfig
-from resources_servers.usersim.episode_contracts import UserSimActivationRequest, UserSimActivationResult
+from resources_servers.usersim.episode_contracts import (
+    UserSimActivationRequest,
+    UserSimActivationResult,
+    UserSimAgentRecordRequest,
+    UserSimRoleModel,
+    UserSimSeedSessionRequest,
+)
 from responses_api_agents.simple_agent.app import TOOL_CALL_ID_HEADER, SimpleAgent, SimpleAgentConfig
 
 
-USERSIM_REVISION = "4fd4c800bbef8883329543df632f328860fc6429"
+USERSIM_REVISION = "a4665b3ce1a030e83871232e2fb69e5b39480818"
 
 
 def _message_value(message: Any, name: str, default: Any = None) -> Any:
@@ -144,9 +149,15 @@ class _ParityClient(ServerClient):
                     UserSimActivationResult.model_validate(kwargs["json"]),
                 )
                 return _HTTPResponse(value.model_dump_json().encode())
-            if url_path == "/runtime/tool_calls":
-                value = await self.resources.invoke_probe_tool_batch(self.resources_request, kwargs["json"])
-                return _HTTPResponse(json.dumps(value).encode())
+            if url_path == "/runtime/pending":
+                value = await self.resources.pending_runtime_event(self.resources_request)
+                return _HTTPResponse(value.model_dump_json().encode())
+            if url_path == "/runtime/record":
+                value = await self.resources.record_agent_output(
+                    self.resources_request,
+                    UserSimAgentRecordRequest.model_validate(kwargs["json"]),
+                )
+                return _HTTPResponse(value.model_dump_json().encode())
             response = await self.resources.invoke_probe_tool(
                 self.resources_request,
                 url_path.removeprefix("/"),
@@ -216,35 +227,29 @@ class _GymBridge:
         self.models = {role: _ReplayableModel(role) for role in ("user", "judge", "summary")}
 
     async def invoke(self, activation: UserSimActivationRequest) -> UserSimActivationResult:
-        if activation.role != "assistant":
-            response = await self.models[activation.role].acompletion(
-                activation.messages,
-                **activation.parameters,
-            )
-            return UserSimActivationResult(
-                activation_id=activation.activation_id,
-                response=_chat_response(response),
-            )
-
-        values: dict[str, Any] = {
-            "input": [item for message in activation.messages for item in _to_responses_input_items(message)]
-        }
-        _apply_activation_parameters(values, activation.parameters, assistant_tools=self.assistant_tools)
-        response, _, _, _ = await self.agent._create_episode(
-            NeMoGymResponseCreateParamsNonStreaming.model_validate(values),
-            model_url_path="/v1/responses",
-            resources_server_cookies={},
-            tool_loop_policy=(
-                AgentToolLoopPolicy.model_validate(activation.assistant_tool_loop_policy.model_dump(mode="json"))
-                if activation.assistant_tool_loop_policy is not None
-                else None
-            ),
-            tool_batch_path="/runtime/tool_calls",
+        response = await self.models[activation.role].acompletion(
+            activation.messages,
+            **activation.parameters,
         )
         return UserSimActivationResult(
             activation_id=activation.activation_id,
-            transcript_delta=_response_output_messages(NeMoGymResponse.model_validate(response)),
+            response=_chat_response(response),
         )
+
+    async def invoke_assistant(self, activation: UserSimActivationRequest) -> None:
+        values: dict[str, Any] = {
+            "input": [item for message in activation.messages for item in _to_responses_input_items(message)]
+        }
+        _apply_activation_parameters(values, activation.parameters, tools=activation.tools)
+        # The Agent owns the model/tool loop: it records each response with
+        # Resources, which is what advances the episode, and follows the reply.
+        await self.agent._create_episode(
+            NeMoGymResponseCreateParamsNonStreaming.model_validate(values),
+            model_url_path="/v1/responses",
+            resources_server_cookies={},
+            record_outputs_path="/runtime/record",
+        )
+        return None
 
 
 def _normalized_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -257,12 +262,14 @@ def _normalized_result(result: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-async def test_prepared_task_matches_standalone_generator_through_gym_stack(monkeypatch) -> None:
+@pytest.mark.parametrize("probe_type", known_probes())
+async def test_prepared_task_matches_standalone_generator_through_gym_stack(probe_type, monkeypatch) -> None:
+    """Every registered probe reproduces a standalone run through the Gym stack."""
     monkeypatch.setattr("usersim.engine.core.episode_input.get_code_sha", lambda: USERSIM_REVISION)
     [resolved_row] = materialize_episode_inputs(
         locale="en_US",
         num_rows=1,
-        probe_mix={"safety_agentic": 1.0},
+        probe_mix={probe_type: 1.0},
         random_seed=42,
     )
     direct_models = {
@@ -283,17 +290,38 @@ async def test_prepared_task_matches_standalone_generator_through_gym_stack(monk
             port=8000,
             entrypoint="app.py",
             name="resources",
+            tool_simulation_model=ModelServerRef(type="responses_api_models", name="support"),
         ),
         server_client=MagicMock(spec=ServerClient),
+    )
+    # The API-response simulator is UserSim's own, in both runs, and the
+    # declared role models are the ones the standalone run resolved.
+    monkeypatch.setattr(
+        UserSimResourcesServer,
+        "_create_probe_runtime",
+        lambda _self, resolved, role_models: ProbeEpisodeRuntime.from_resolved_row(
+            resolved,
+            models={
+                "api_response_model": _ReplayableModel("api"),
+                **{
+                    alias: HostRoleModel(model_name=model.model_name, max_tokens=model.max_tokens)
+                    for alias, model in role_models.items()
+                },
+            },
+        ),
     )
     resources_request = SimpleNamespace(session={SESSION_ID_KEY: "parity-session"})
     seed = await resources.seed_session(
         resources_request,
-        ResourcesSeedSessionRequest(
+        UserSimSeedSessionRequest(
             resources_session_id="resources-session",
             episode_id=EpisodeId(rollout_id="parity", attempt=0),
-            task_id=TaskId(taskset="usersim:example", task_id="safety_agentic"),
+            task_id=TaskId(taskset="usersim:example", task_id=probe_type),
             task_data={"resolved_row": resolved_row},
+            role_models={
+                alias: UserSimRoleModel(model_name=_ReplayableModel.model_name)
+                for alias in ("user_model", "assistant_model", "judge_model", "summary_model")
+            },
         ),
     )
     client = _ParityClient(
@@ -335,6 +363,4 @@ async def test_prepared_task_matches_standalone_generator_through_gym_stack(monk
     assert _normalized_result(gym_result) == _normalized_result(standalone_result)
     assert resolved_row["trajectory_id"] == standalone["trajectory_id"]
     assert resolved_row["usersim_provenance"] == standalone["usersim_provenance"]
-    traces = _normalized_result(gym_result)["simulation_traces"]
-    assert [(trace["turn_idx"], trace["call_idx"]) for trace in traces] == [(0, 0)]
-    assert client.model_calls == 2
+    assert client.model_calls >= 1

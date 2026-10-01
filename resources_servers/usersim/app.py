@@ -16,7 +16,6 @@ from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
     ResourcesCloseSessionRequest,
     ResourcesCloseSessionResponse,
-    ResourcesSeedSessionRequest,
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import ModelServerRef
@@ -36,9 +35,13 @@ from resources_servers.usersim.episode_contracts import (
     ProbeRuntimeDescriptor,
     UserSimActivationRequest,
     UserSimActivationResult,
+    UserSimAgentRecordRequest,
+    UserSimAgentRecordResponse,
     UserSimEpisodeLifecycleComplete,
     UserSimLifecycleEvent,
+    UserSimRoleModel,
     UserSimSeedResponse,
+    UserSimSeedSessionRequest,
     UserSimSimulationResult,
     UserSimTaskInput,
     UserSimVerification,
@@ -67,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 class UserSimResourcesServerConfig(BaseResourcesServerConfig):
     usersim_revision: str = Field(
-        "4fd4c800bbef8883329543df632f328860fc6429",  # pragma: allowlist secret
+        "a4665b3ce1a030e83871232e2fb69e5b39480818",  # pragma: allowlist secret
         pattern=r"^[0-9a-f]{40}$",
     )
     tool_simulation_model: ModelServerRef | None = None
@@ -82,6 +85,11 @@ class SeededUserSimEpisode(BaseModel):
     task_id: TaskId
     seed: UserSimSeedResponse
     runtime: Any | None = None
+    #: What the episode is waiting on. The Agent advances the lifecycle itself
+    #: for assistant turns, so the Environment re-reads this rather than
+    #: assuming the event its own last call returned is still current.
+    pending_event: Any | None = None
+    lifecycle_completed: bool = False
 
 
 def _conversation_roles(result: UserSimSimulationResult) -> set[str]:
@@ -194,11 +202,30 @@ class UserSimResourcesServer(SimpleResourcesServer):
     config: UserSimResourcesServerConfig
     session_id_to_seed: dict[str, SeededUserSimEpisode] = Field(default_factory=dict)
 
+    def model_post_init(self, context: Any) -> None:
+        """Load UserSim's probe registry and assets before accepting work.
+
+        Importing the generator bootstraps every probe module and the asset
+        banks they resolve at class level. Left to the first episodes that work
+        lands on the event loop and stalls every other episode in the process;
+        doing it here charges it to startup instead.
+        """
+        super().model_post_init(context)
+        import usersim.engine.generator  # noqa: F401
+        from usersim.engine.core.probes import known_probes, resolve_probe
+        from usersim.engine.core.provenance import get_code_sha
+
+        get_code_sha()
+        for label in known_probes():
+            resolve_probe(label)
+        logger.info("Loaded the UserSim probe registry (%d probes) at startup", len(known_probes()))
+
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
         app.post("/runtime/start", response_model=UserSimLifecycleEvent)(self.start_runtime_lifecycle)
         app.post("/runtime/advance", response_model=UserSimLifecycleEvent)(self.advance_runtime_lifecycle)
-        app.post("/runtime/tool_calls")(self.invoke_probe_tool_batch)
+        app.post("/runtime/pending", response_model=UserSimLifecycleEvent)(self.pending_runtime_event)
+        app.post("/runtime/record")(self.record_agent_output)
         app.post("/{tool_name}")(self.invoke_probe_tool)
         return app
 
@@ -222,7 +249,7 @@ class UserSimResourcesServer(SimpleResourcesServer):
     async def seed_session(
         self,
         request: Request,
-        body: ResourcesSeedSessionRequest,
+        body: UserSimSeedSessionRequest,
     ) -> UserSimSeedResponse:
         try:
             task = UserSimTaskInput.model_validate(body.task_data)
@@ -230,7 +257,7 @@ class UserSimResourcesServer(SimpleResourcesServer):
             raise HTTPException(status_code=422, detail=error.errors()) from error
         session_id = request.session[SESSION_ID_KEY]
         result = self._resolve_seed(task, body.resources_session_id)
-        runtime = self._create_probe_runtime(result.resolved_row)
+        runtime = self._create_probe_runtime(result.resolved_row, body.role_models)
         descriptor = ProbeRuntimeDescriptor.model_validate((await runtime.descriptor()).to_dict())
         result = result.model_copy(
             update={
@@ -249,16 +276,26 @@ class UserSimResourcesServer(SimpleResourcesServer):
     def _create_probe_runtime(
         self,
         resolved_row: dict[str, Any],
+        role_models: Mapping[str, UserSimRoleModel],
     ) -> Any:
-        from usersim.engine.core.episode_runtime import ProbeEpisodeRuntime
+        from usersim.engine.core.episode_runtime import HostRoleModel, ProbeEpisodeRuntime
 
         if resolved_row.get("probe_type") == "tool_calling" and self.config.tool_simulation_model is None:
             raise ValueError("tool_calling requires resources tool_simulation_model configuration")
-        models = {}
+        models: dict[str, Any] = {}
         if self.config.tool_simulation_model is not None:
             models["api_response_model"] = _ResourcesModelFacade(
                 self,
                 self.config.tool_simulation_model,
+            )
+        # Trajectory identity is keyed on the resolved model id, and
+        # identity_disclosure cannot grade an assistant it cannot name, so the
+        # models this environment runs have to reach UserSim rather than the
+        # defaults preparation happened to be configured with.
+        for alias, role_model in role_models.items():
+            models[alias] = HostRoleModel(
+                model_name=role_model.model_name,
+                max_tokens=role_model.max_tokens,
             )
         return ProbeEpisodeRuntime.from_resolved_row(resolved_row, models=models)
 
@@ -359,35 +396,82 @@ class UserSimResourcesServer(SimpleResourcesServer):
         body: dict[str, Any] = Body(),
         tool_call_id: str | None = Header(None, alias="X-NeMo-Gym-Tool-Call-Id"),
     ) -> Response:
-        """Simulate one tool selected for the request's seeded episode."""
+        """Return the payload UserSim's own loop produced for one recorded call.
+
+        UserSim executes every tool call itself, with its own turn and call
+        indices and its own context, as part of recording the response that
+        asked for it. The Agent records first and then collects the payloads
+        here, so they land in its trajectory next to the calls it issued.
+
+        The payload is returned verbatim as text: several probes' simulated
+        responses are not JSON.
+        """
+        del body, tool_name
         seeded = self._seeded_episode(request)
         if seeded.runtime is None:
             raise HTTPException(status_code=404, detail="This episode does not expose probe tools")
         if tool_call_id is None:
             raise HTTPException(status_code=422, detail="Runtime tool calls require a tool_call_id header")
         try:
-            payload = await seeded.runtime.simulate_tool_call(
-                tool_name,
-                body,
-                tool_call_id=tool_call_id,
-            )
-        except ValueError as error:
+            payload = await seeded.runtime.tool_result(tool_call_id)
+        except Exception as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         return Response(content=payload, media_type="text/plain")
 
-    async def invoke_probe_tool_batch(
+    async def record_agent_output(
         self,
         request: Request,
-        body: list[dict[str, Any]] = Body(),
-    ) -> list[str]:
-        """Simulate one ordered parallel tool-call batch."""
+        body: UserSimAgentRecordRequest,
+    ) -> UserSimAgentRecordResponse:
+        """Record one Assistant-Agent response and say what the Agent does next.
+
+        Recording is what makes UserSim execute the response's tool calls, in
+        its own loop and with its own indices. The reply carries the loop's
+        next decision so the Agent never has to model it.
+        """
+        from usersim.engine.core.episode_runtime import EpisodeContractError
+
         seeded = self._seeded_episode(request)
-        if seeded.runtime is None:
-            raise HTTPException(status_code=404, detail="This episode does not expose probe tools")
+        pending = seeded.pending_event
+        if not isinstance(pending, UserSimActivationRequest) or pending.role != "assistant":
+            raise HTTPException(
+                status_code=409,
+                detail="This episode is not waiting on an Assistant-Agent response",
+            )
+        executed_before = {call.tool_call_id for call in await seeded.runtime.executed_tool_calls()}
+        recorded = {"activation_id": pending.activation_id, **body.model_dump(mode="json", exclude_none=True)}
         try:
-            return await seeded.runtime.simulate_tool_calls(body)
-        except ValueError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+            event = await seeded.runtime.advance(recorded)
+        except EpisodeContractError as error:
+            # A host bug, not a model failure: it must not consume a model
+            # retry or be attributed to the model under test.
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        lifecycle_event = self._record_lifecycle_event(seeded, event)
+        executed_now = [
+            call.tool_call_id
+            for call in await seeded.runtime.executed_tool_calls()
+            if call.tool_call_id not in executed_before
+        ]
+        if isinstance(lifecycle_event, UserSimEpisodeLifecycleComplete):
+            return UserSimAgentRecordResponse(
+                should_continue=False,
+                complete=True,
+                executed_tool_call_ids=executed_now,
+            )
+        # The Agent keeps its loop running only while UserSim is still asking
+        # the assistant to continue the turn it is already in.
+        continues = lifecycle_event.role == "assistant" and lifecycle_event.continues_turn
+        if not continues:
+            return UserSimAgentRecordResponse(should_continue=False, executed_tool_call_ids=executed_now)
+        return UserSimAgentRecordResponse(
+            should_continue=True,
+            activation_id=lifecycle_event.activation_id,
+            input=[item for message in lifecycle_event.messages for item in _to_responses_input_items(message)],
+            tools=[_to_responses_tool(tool) for tool in lifecycle_event.tools],
+            executed_tool_call_ids=executed_now,
+        )
 
     async def start_runtime_lifecycle(
         self,
@@ -399,7 +483,7 @@ class UserSimResourcesServer(SimpleResourcesServer):
             event = await seeded.runtime.advance()
         except (TypeError, ValueError, RuntimeError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        return _lifecycle_event(event)
+        return self._record_lifecycle_event(seeded, event)
 
     async def advance_runtime_lifecycle(
         self,
@@ -407,12 +491,35 @@ class UserSimResourcesServer(SimpleResourcesServer):
         body: UserSimActivationResult,
     ) -> UserSimLifecycleEvent:
         """Submit one activation result and return the next lifecycle event."""
+        from usersim.engine.core.episode_runtime import EpisodeContractError
+
         seeded = self._seeded_episode(request)
         try:
-            event = await seeded.runtime.advance(body.model_dump(mode="json"))
+            event = await seeded.runtime.advance(body.model_dump(mode="json", exclude_none=True))
+        except EpisodeContractError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         except (TypeError, ValueError, RuntimeError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        return _lifecycle_event(event)
+        return self._record_lifecycle_event(seeded, event)
+
+    async def pending_runtime_event(self, request: Request) -> UserSimLifecycleEvent:
+        """Return what the episode is waiting on, without advancing it.
+
+        The Environment uses this after handing an assistant turn to the Agent:
+        the Agent recorded its own responses, so the Environment has to re-read
+        where the episode got to rather than submit anything.
+        """
+        seeded = self._seeded_episode(request)
+        if seeded.pending_event is None:
+            raise HTTPException(status_code=409, detail="The UserSim episode lifecycle has not started")
+        return seeded.pending_event
+
+    def _record_lifecycle_event(self, seeded: SeededUserSimEpisode, event: Any) -> UserSimLifecycleEvent:
+        lifecycle_event = _lifecycle_event(event)
+        seeded.pending_event = lifecycle_event
+        if isinstance(lifecycle_event, UserSimEpisodeLifecycleComplete):
+            seeded.lifecycle_completed = True
+        return lifecycle_event
 
     async def verify(
         self,
@@ -431,7 +538,7 @@ class UserSimResourcesServer(SimpleResourcesServer):
                 detail="Verified NeMo UserSim resolved episode does not match the seeded session",
             )
         native_result = verification_input.usersim_result
-        if getattr(seeded.runtime, "_lifecycle_started", False):
+        if seeded.runtime is not None and seeded.lifecycle_completed:
             native_result = UserSimSimulationResult.model_validate(await seeded.runtime.finalize())
         native_scorer_name, native_scores, native_scorer_pass = await self._score_native_result(
             seeded,
@@ -497,10 +604,8 @@ class UserSimResourcesServer(SimpleResourcesServer):
         seeded = self._seeded_episode(request)
         if body.resources_session_id != seeded.seed.resources_session_id or body.episode_id != seeded.episode_id:
             raise HTTPException(status_code=409, detail="Resources session does not match the active episode")
-        lifecycle_task = getattr(seeded.runtime, "_lifecycle_task", None)
-        if isinstance(lifecycle_task, asyncio.Task) and not lifecycle_task.done():
-            lifecycle_task.cancel()
-            await asyncio.gather(lifecycle_task, return_exceptions=True)
+        if seeded.runtime is not None:
+            await seeded.runtime.close()
         del self.session_id_to_seed[session_id]
         return ResourcesCloseSessionResponse(resources_session_id=body.resources_session_id)
 
