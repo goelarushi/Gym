@@ -583,6 +583,33 @@ def test_incomplete_rollout_snapshots_are_saved_without_grading(tmp_path: Path) 
     assert json.loads((output_dir / "rollout.json").read_text())["completion_status"] == "max_turns"
 
 
+def test_failed_prebuilt_world_logs_are_kept_in_full(tmp_path: Path) -> None:
+    agent = _agent()
+    agent.config.artifact_output_dir = str(tmp_path / "saved")
+    body = _body()
+
+    class FakeSandbox:
+        async def download(self, source: str, destination: Path) -> None:
+            if source.endswith("environment.log"):
+                destination.write_text("full startup log")
+            else:
+                raise FileNotFoundError(source)
+
+    output_dir = asyncio.run(agent._persist_world_logs(FakeSandbox(), body))
+
+    assert output_dir is not None and "_failed_" in output_dir.name
+    assert (output_dir / "environment.log").read_text() == "full startup log"
+    assert not (output_dir / "world_bundle.txt").exists()
+
+
+def test_failed_prebuilt_world_logs_need_an_artifact_dir() -> None:
+    class FailingSandbox:
+        async def download(self, source: str, destination: Path) -> None:
+            raise AssertionError("nothing should be downloaded")
+
+    assert asyncio.run(_agent()._persist_world_logs(FailingSandbox(), _body())) is None
+
+
 async def _idle_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Accept a connection, hold it open until the peer goes away, then close it."""
     await reader.read()
