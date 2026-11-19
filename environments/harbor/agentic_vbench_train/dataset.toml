@@ -26,3 +26,7 @@ allowed_agents = ["opencode_agent"]
 # transcribe the agent's clip before they score it, and some repair metrics are single-threaded. The agent budgets
 # stay as the tasks declare them.
 verifier_timeout_multiplier = 3.0
+# The judges write reward.txt (the number) and reward.json with a `details` object beside the reward, as the
+# benchmark's do: read the text file first and ignore the non-numeric JSON fields instead of voiding the reward.
+reward_file_precedence = "txt"
+reward_json_non_numeric = "ignore"

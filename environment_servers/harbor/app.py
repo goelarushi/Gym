@@ -999,7 +999,7 @@ class HarborEnvironmentServer(
         if task_input.turns:
             first = task_input.turns[0]
             first.responses_create_params = wrapped(first.responses_create_params)
-        else:
+        if task_input.responses_create_params is not None:
             task_input.responses_create_params = wrapped(task_input.responses_create_params)
         return request
 
@@ -1446,6 +1446,11 @@ class HarborEnvironmentServer(
                 ),
                 terminal=True,
             )
+        top_level = request.task.task_input.responses_create_params
+        if top_level is not None and len(inputs) == 1:
+            # A single-step row's step runs with the top-level parameters: they are the copy a training framework
+            # edits (sampling values, output budget) before it sends the row (see HarborTaskInput.one_shape).
+            inputs[0].responses_create_params = top_level
         continued = self.config.turn_sessions == "continue" and len(task.turns) > 1
         handle: _AgentSessionHandle | None = None
         results: list[HarborTurnResult] = []

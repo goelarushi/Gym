@@ -942,13 +942,40 @@ class TestMaterialize:
             validate(
                 {
                     "responses_create_params": params,
-                    "turns": [{"name": "a", "responses_create_params": params}],
+                    "turns": [
+                        {"name": "a", "responses_create_params": params},
+                        {"name": "b", "responses_create_params": params},
+                    ],
                     DIGEST_KEY: task.digest,
                 }
             )
         multi = materialize_task(load_task(write_multi_step_task(tmp_path / "t")), "ds")
         assert multi.task_input.model_fields_set == {"task_data", "turns"}
         assert "responses_create_params" not in multi.model_dump(mode="json", exclude_unset=True)["task_input"]
+
+    def test_a_single_step_rows_parameters_are_also_at_the_top_level(self, tmp_path):
+        """A task with one `[[steps]]` entry is a one-turn row for the server (`turns` names the step) and a flat row
+        for a training framework that reads `task_input.responses_create_params` (NeMo RL does, and rejects a row
+        without it). Materialize writes the step's parameters in both places, and the pairing validates; the server
+        runs the step with the top-level copy."""
+        root = write_task(tmp_path / "one-step", toml=HELLO_TOML + '[[steps]]\nname = "solve"\n')
+        (root / "steps" / "solve" / "tests").mkdir(parents=True)
+        (root / "steps" / "solve" / "instruction.md").write_text("Solve it.")
+        (root / "steps" / "solve" / "tests" / "test.sh").write_text(
+            "#!/bin/bash\necho 1 > /logs/verifier/reward.txt\n"
+        )
+        task = load_task(root)
+        assert [turn.name for turn in task.turns] == ["solve"]
+        row = materialize_task(task, "ds")
+        assert row.task_input.model_fields_set == {"task_data", "turns", "responses_create_params"}
+        dumped = row.model_dump(mode="json", exclude_unset=True)["task_input"]
+        assert [turn["name"] for turn in dumped["turns"]] == ["solve"]
+        assert dumped["responses_create_params"] == dumped["turns"][0]["responses_create_params"]
+        assert dumped["responses_create_params"]["input"][0]["content"] == "Solve it."
+        assert materialize_module.HarborTaskInput.model_validate(dumped) == row.task_input
+        # The copies are independent: a framework editing the top-level sampling values leaves the turn's intact.
+        row.task_input.responses_create_params.temperature = 0.5
+        assert row.task_input.turns[0].responses_create_params.temperature is None
 
     def test_write_rows_and_run_config(self, tmp_path):
         folder = tmp_path / "ds"

@@ -3,6 +3,7 @@
 
 """Turn loaded tasks into episode rows and the run config that serves them."""
 
+import copy
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -83,6 +84,11 @@ class HarborTaskInput(BaseModel):
 
     @model_validator(mode="after")
     def one_shape(self) -> Self:
+        if self.responses_create_params is not None and len(self.turns) == 1:
+            # A single-step task's row carries its step's parameters in both places: ``turns`` names the step for
+            # the server (which runs the step with the top-level parameters, the ones a training framework edits,
+            # see ``_run_turns``), ``responses_create_params`` is what a flat-row consumer such as NeMo RL reads.
+            return self
         if (self.responses_create_params is None) == (not self.turns):
             raise ValueError("A Harbor row has either responses_create_params or turns, not both")
         return self
@@ -141,18 +147,22 @@ def materialize_task(
     if dataset_digest is not None:
         task_data[DATASET_DIGEST_KEY] = dataset_digest
     if task.turns:
-        task_input = HarborTaskInput(
-            task_data=task_data,
-            turns=[
-                HarborTurnInput(
-                    name=turn.name,
-                    responses_create_params=_turn_params(
-                        turn.instruction, task.config.step_agent_timeout_sec(turn.config), step=turn.name
-                    ),
-                )
-                for turn in task.turns
-            ],
+        turns = [
+            HarborTurnInput(
+                name=turn.name,
+                responses_create_params=_turn_params(
+                    turn.instruction, task.config.step_agent_timeout_sec(turn.config), step=turn.name
+                ),
+            )
+            for turn in task.turns
+        ]
+        # A single-step task also carries the step's parameters at the top level, where a flat-row consumer (NeMo RL
+        # reads ``task_input.responses_create_params``) finds them; see ``one_shape``. A multi-step row leaves the
+        # field unset, so its serialized form carries no ``null``.
+        top_level = (
+            {"responses_create_params": copy.deepcopy(turns[0].responses_create_params)} if len(turns) == 1 else {}
         )
+        task_input = HarborTaskInput(task_data=task_data, turns=turns, **top_level)
     else:
         task_input = HarborTaskInput(
             responses_create_params=_turn_params(task.instruction, task.config.agent.timeout_sec),

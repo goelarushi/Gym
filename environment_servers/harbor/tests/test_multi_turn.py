@@ -941,6 +941,33 @@ async def test_rows_whose_turns_differ_from_the_task_fail_terminally(tmp_path, m
     assert response.failure.terminal and "do not match the steps" in response.failure.failure_reason
 
 
+async def test_a_single_step_row_runs_its_step_with_the_top_level_parameters(tmp_path, monkeypatch):
+    """A one-step task's row carries the step's parameters as `turns[0]` (so the row names the step and passes the
+    turns-against-steps check) and at the top level (what a training framework reads and edits before it sends the
+    row). The server runs the single step with the top-level copy, so the framework's edits reach the harness."""
+    steps = '[[steps]]\nname = "solve"\n'
+    server, task, sandbox, created = multi_turn_server(tmp_path, monkeypatch, steps, {"solve": "Solve it."})
+    rewards_per_turn(server, sandbox, ["1"])
+    request = request_for(task)
+    row = request.task.task_input
+    assert row.responses_create_params is not None and [turn.name for turn in row.turns] == ["solve"]
+    row.responses_create_params.input[0].content = "Solve it, edited by the trainer."
+    row.responses_create_params.max_output_tokens = 4096
+
+    response = await server.run_request(request)
+
+    assert response.failure is None and response.result.reward == 1.0
+    assert [turn.name for turn in response.result.turns] == ["solve"]
+    sent = [
+        call[2]["json"].model_dump(mode="json", exclude_unset=True)
+        for call in server.server_client.calls
+        if call[1].endswith("/v1/responses")
+    ]
+    assert [turn["input"][0]["content"] for turn in sent] == ["Solve it, edited by the trainer."]
+    assert sent[0]["max_output_tokens"] == 4096
+    assert len(created) == 1
+
+
 async def test_a_single_turn_row_for_a_multi_step_task_is_refused_at_seed(tmp_path, monkeypatch):
     """Review (CI bot, round 34): a row with the task's digest and a top-level `responses_create_params` but no
     `turns` (a hand-built or stale-shaped row) passed the request schema for a task that has steps and took the
